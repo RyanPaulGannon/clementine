@@ -9,6 +9,7 @@ use crate::cpu::alu_instruction::ShiftKind;
 use crate::cpu::condition::Condition;
 use crate::cpu::cpu_modes::Mode;
 use crate::cpu::instruction::{ArmModeInstruction, ThumbModeInstruction};
+use crate::cpu::move_compare_add_sub::ThumbHighRegisterOperation;
 use crate::cpu::opcode::ArmModeOpcode;
 use crate::cpu::psr::Psr;
 use crate::cpu::register_bank::RegisterBank;
@@ -118,7 +119,10 @@ impl Arm7tdmi {
                 Multiply => todo!(),
                 MultiplyLong => todo!(),
                 SingleDataSwap => todo!(),
-                BranchAndExchange(_, register) => self.branch_and_exchange(register),
+                BranchAndExchange {
+                    condition: _,
+                    register,
+                } => self.branch_and_exchange(register),
                 HalfwordDataTransferRegisterOffset => self.half_word_data_transfer(op_code),
                 HalfwordDataTransferImmediateOffset => self.half_word_data_transfer(op_code),
                 SingleDataTransfer {
@@ -222,9 +226,9 @@ impl Arm7tdmi {
             AluOp { op, rs, rd } => self.alu_op(op, rs, rd),
             HiRegisterOpBX {
                 op,
-                reg_source,
-                reg_destination,
-            } => self.hi_reg_operation_branch_ex(op, reg_source, reg_destination),
+                source_register,
+                destination_register,
+            } => self.hi_reg_operation_branch_ex(op, source_register, destination_register),
             PCRelativeLoad {
                 r_destination,
                 immediate_value,
@@ -250,7 +254,17 @@ impl Arm7tdmi {
                 r_destination,
             ),
             LoadStoreImmOffset => self.load_store_immediate_offset(op_code),
-            LoadStoreHalfword => self.load_store_halfword(op_code),
+            LoadStoreHalfword {
+                load_store,
+                offset,
+                base_register,
+                source_destination_register,
+            } => self.load_store_halfword(
+                load_store,
+                offset,
+                base_register,
+                source_destination_register,
+            ),
             SPRelativeLoadStore {
                 load_store,
                 r_destination,
@@ -379,24 +393,33 @@ impl Arm7tdmi {
         Some(SIZE_OF_THUMB_INSTRUCTION)
     }
 
-    fn load_store_halfword(&mut self, op_code: ThumbModeOpcode) -> Option<u32> {
-        let load_store: LoadStoreKind = op_code.get_bit(11).into();
-        let offset = op_code.get_bits(6..=10) << 1;
-        let rb = op_code.get_bits(3..=5);
-        let rb = self.registers.register_at(rb.try_into().unwrap());
-        let rd: usize = op_code.get_bits(0..=2).try_into().unwrap();
-
+    fn load_store_halfword(
+        &mut self,
+        load_store: LoadStoreKind,
+        offset: u16,
+        base_register: u16,
+        source_destination_register: u16,
+    ) -> Option<u32> {
+        let rb = self
+            .registers
+            .register_at(base_register.try_into().unwrap());
         let address: usize = rb.wrapping_add(offset as u32).try_into().unwrap();
-
         let mut mem = self.memory.lock().unwrap();
 
         match load_store {
             LoadStoreKind::Load => {
-                self.registers
-                    .set_register_at(rd, mem.read_half_word(address) as u32);
+                self.registers.set_register_at(
+                    source_destination_register as usize,
+                    mem.read_half_word(address) as u32,
+                );
             }
             LoadStoreKind::Store => {
-                mem.write_half_word(address, self.registers.register_at(rd) as u16);
+                mem.write_half_word(
+                    address,
+                    self.registers
+                        .register_at(source_destination_register as usize)
+                        as u16,
+                );
             }
         }
 
@@ -407,9 +430,8 @@ impl Arm7tdmi {
         if self.cpsr.can_execute(condition) {
             let pc = self.registers.program_counter() as i32;
             let new_pc = pc + 4 + immediate_offset;
-
             self.registers.set_program_counter(new_pc as u32);
-
+            log("cond branch can execute");
             None
         } else {
             Some(SIZE_OF_THUMB_INSTRUCTION)
@@ -808,16 +830,17 @@ impl Arm7tdmi {
         rn: u32,
         reg_list: u32,
     ) -> Option<u32> {
-        let memory_base = self.registers.register_at(rn.try_into().unwrap());
+        let base_register = rn.try_into().unwrap();
+        let memory_base = self.registers.register_at(base_register);
         let mut address = memory_base.try_into().unwrap();
 
         if load_psr {
             unimplemented!();
         }
 
-        match load_store {
+        let transfer = match load_store {
             LoadStoreKind::Store => {
-                let transfer = |arm: &mut Self, address: usize, reg_source: usize| {
+                |arm: &mut Self, address: usize, reg_source: usize| {
                     let mut value = arm.registers.register_at(reg_source);
 
                     // If R15 we get the value of the current instruction + 12
@@ -830,30 +853,25 @@ impl Arm7tdmi {
                     memory.write_at(address + 1, value.get_bits(8..=15) as u8);
                     memory.write_at(address + 2, value.get_bits(16..=23) as u8);
                     memory.write_at(address + 3, value.get_bits(24..=31) as u8);
-                };
-
-                self.exec_data_transfer(reg_list, indexing, &mut address, offsetting, transfer);
+                }
             }
-            LoadStoreKind::Load => {
-                let transfer = |arm: &mut Self, address: usize, reg_destination: usize| {
-                    let memory = arm.memory.lock().unwrap();
+            LoadStoreKind::Load => |arm: &mut Self, address: usize, reg_destination: usize| {
+                let memory = arm.memory.lock().unwrap();
+                let part_0: u32 = memory.read_at(address).try_into().unwrap();
+                let part_1: u32 = memory.read_at(address + 1).try_into().unwrap();
+                let part_2: u32 = memory.read_at(address + 2).try_into().unwrap();
+                let part_3: u32 = memory.read_at(address + 3).try_into().unwrap();
+                drop(memory);
+                let v = part_3 << 24_u32 | part_2 << 16_u32 | part_1 << 8_u32 | part_0;
+                arm.registers.set_register_at(reg_destination, v);
+            },
+        };
 
-                    let part_0: u32 = memory.read_at(address).try_into().unwrap();
-                    let part_1: u32 = memory.read_at(address + 1).try_into().unwrap();
-                    let part_2: u32 = memory.read_at(address + 2).try_into().unwrap();
-                    let part_3: u32 = memory.read_at(address + 3).try_into().unwrap();
-                    drop(memory);
-                    let v = part_3 << 24_u32 | part_2 << 16_u32 | part_1 << 8_u32 | part_0;
-                    arm.registers.set_register_at(reg_destination, v);
-                };
-
-                self.exec_data_transfer(reg_list, indexing, &mut address, offsetting, transfer);
-            }
-        }
+        self.exec_data_transfer(reg_list, indexing, &mut address, offsetting, transfer);
 
         if write_back {
             self.registers
-                .set_register_at(rn.try_into().unwrap(), address.try_into().unwrap());
+                .set_register_at(base_register, address.try_into().unwrap());
         };
 
         // If LDM and R15 is in register list we don't advance PC
@@ -934,9 +952,10 @@ impl Arm7tdmi {
 
     pub fn pc_relative_load(&mut self, r_destination: u16, immediate_value: u16) -> Option<u32> {
         let mut pc = self.registers.program_counter() as u32;
+        // word alignment
         pc.set_bit_off(1);
-        let v = (immediate_value as usize) << 2;
-        let address = pc as usize + 4_usize + v;
+        pc.set_bit_off(0);
+        let address = pc as usize + 4_usize + immediate_value as usize;
         let value = self.memory.lock().unwrap().read_word(address);
         let dest = r_destination.try_into().unwrap();
         self.registers.set_register_at(dest, value);
@@ -946,7 +965,7 @@ impl Arm7tdmi {
 
     pub(crate) fn hi_reg_operation_branch_ex(
         &mut self,
-        op: u16,
+        op: ThumbHighRegisterOperation,
         reg_source: u16,
         reg_destination: u16,
     ) -> Option<u32> {
@@ -954,8 +973,7 @@ impl Arm7tdmi {
         let s_value = self.registers.register_at(reg_source as usize);
 
         match op {
-            // Add
-            0b00 => {
+            ThumbHighRegisterOperation::Add => {
                 let r = d_value.wrapping_add(s_value);
                 self.registers.set_register_at(reg_destination as usize, r);
 
@@ -966,8 +984,7 @@ impl Arm7tdmi {
                     Some(SIZE_OF_THUMB_INSTRUCTION)
                 }
             }
-            // Cmp
-            0b01 => {
+            ThumbHighRegisterOperation::Cmp => {
                 let first_op = d_value
                     + match reg_destination as u32 {
                         REG_PROGRAM_COUNTER => 4,
@@ -986,8 +1003,7 @@ impl Arm7tdmi {
 
                 Some(SIZE_OF_THUMB_INSTRUCTION)
             }
-            // Mov
-            0b10 => {
+            ThumbHighRegisterOperation::Mov => {
                 let second_op = s_value
                     + match reg_source as u32 {
                         REG_PROGRAM_COUNTER => 4,
@@ -1003,21 +1019,19 @@ impl Arm7tdmi {
                     Some(SIZE_OF_THUMB_INSTRUCTION)
                 }
             }
-            // Bx
-            0b11 => {
-                let second_op = s_value
+            ThumbHighRegisterOperation::BxOrBlx => {
+                let value = s_value
                     + match reg_source as u32 {
                         REG_PROGRAM_COUNTER => 4,
                         _ => 0,
                     };
-
-                self.cpsr.set_cpu_state(second_op.get_bit(0).into());
-
-                self.registers.set_program_counter(second_op);
+                let new_state = value.get_bit(0);
+                self.cpsr.set_cpu_state(new_state.into());
+                let new_pc = value & !1;
+                self.registers.set_program_counter(new_pc);
 
                 None
             }
-            _ => unreachable!(),
         }
     }
 
@@ -1251,7 +1265,13 @@ mod tests {
             let op_code = 0b1110_0_0_0_1_0_0_1_0_1_1_1_1_1_1_1_1_1_1_1_1_0_0_0_1_0000;
             let cpu = Arm7tdmi::default();
             let op_code: ArmModeOpcode = cpu.decode(op_code);
-            assert_eq!(op_code.instruction, BranchAndExchange(Condition::AL, 0));
+            assert_eq!(
+                op_code.instruction,
+                BranchAndExchange {
+                    condition: Condition::AL,
+                    register: 0
+                }
+            );
             let asm = op_code.instruction.disassembler();
             assert_eq!(asm, "BX R0");
         }
@@ -1696,7 +1716,7 @@ mod tests {
             op_code.instruction,
             ThumbModeInstruction::PCRelativeLoad {
                 r_destination: 1,
-                immediate_value: 88,
+                immediate_value: 352,
             }
         );
 
@@ -1923,24 +1943,24 @@ mod tests {
             assert_eq!(
                 op_code.instruction,
                 ThumbModeInstruction::HiRegisterOpBX {
-                    op: 0b11,
-                    reg_source: 14,
-                    reg_destination: 0,
+                    op: ThumbHighRegisterOperation::BxOrBlx,
+                    source_register: 14,
+                    destination_register: 0,
                 }
             );
             assert_eq!(
                 op_code.instruction,
                 ThumbModeInstruction::HiRegisterOpBX {
-                    op: 0b11,
-                    reg_source: 14,
-                    reg_destination: 0,
+                    op: ThumbHighRegisterOperation::BxOrBlx,
+                    source_register: 14,
+                    destination_register: 0,
                 }
             );
 
             cpu.registers.set_register_at(14, 123);
             cpu.execute_thumb(op_code);
 
-            assert_eq!(cpu.registers.program_counter(), 123);
+            assert_eq!(cpu.registers.program_counter(), 122);
         }
         {
             // Add Rd, Hs
@@ -2400,7 +2420,15 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1000_1_00001_000_001;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(op_code.instruction, ThumbModeInstruction::LoadStoreHalfword);
+            assert_eq!(
+                op_code.instruction,
+                ThumbModeInstruction::LoadStoreHalfword {
+                    load_store: LoadStoreKind::Load,
+                    offset: 2,
+                    base_register: 0,
+                    source_destination_register: 1,
+                }
+            );
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory.lock().unwrap().write_half_word(102, 0xFF);
@@ -2414,7 +2442,15 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1000_0_00001_000_001;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(op_code.instruction, ThumbModeInstruction::LoadStoreHalfword);
+            assert_eq!(
+                op_code.instruction,
+                ThumbModeInstruction::LoadStoreHalfword {
+                    load_store: LoadStoreKind::Store,
+                    offset: 2,
+                    base_register: 0,
+                    source_destination_register: 1,
+                }
+            );
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 0xFF);

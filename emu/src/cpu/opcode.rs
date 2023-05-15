@@ -45,7 +45,7 @@ impl Display for ArmModeOpcode {
             ArmModeInstruction::Multiply => "FMT: |_Cond__|",
             ArmModeInstruction::MultiplyLong => "FMT: |_Cond__|",
             ArmModeInstruction::SingleDataSwap => "FMT: |_Cond__|",
-            ArmModeInstruction::BranchAndExchange(..) => {
+            ArmModeInstruction::BranchAndExchange { .. } => {
                 "FMT: |_Cond__|0_0_0_1|0_0_1_0|1_1_1_1|1_1_1_1|1_1_1_1|0_0_0_1|__Rn___|"
             }
             ArmModeInstruction::HalfwordDataTransferRegisterOffset => {
@@ -137,7 +137,9 @@ impl Display for ThumbModeOpcode {
                 "FMT: |0_1_0_1|H|S|1|_Ro__|_Rb__|_Rd__|"
             }
             ThumbModeInstruction::LoadStoreImmOffset => "FMT: |0_1_1|B|L|_Offset5_|_Rb__|_Rd__|",
-            ThumbModeInstruction::LoadStoreHalfword => "FMT: |1_0_0_0|L|_Offset5_|_Rb__|_Rd__|",
+            ThumbModeInstruction::LoadStoreHalfword { .. } => {
+                "FMT: |1_0_0_0|L|_Offset5_|_Rb__|_Rd__|"
+            }
             ThumbModeInstruction::SPRelativeLoadStore { .. } => {
                 "FMT: |1_0_0_1|L|_Rd__|_____Word8_____|"
             }

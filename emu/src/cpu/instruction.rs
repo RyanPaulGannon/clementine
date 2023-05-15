@@ -7,7 +7,7 @@ use crate::cpu::alu_instruction::{ArmModeAluInstruction, ShiftKind, ThumbModeAlu
 use crate::cpu::arm7tdmi::REG_PROGRAM_COUNTER;
 use crate::cpu::data_processing::{AluSecondOperandInfo, ShiftOperator};
 use crate::cpu::flags::{Indexing, LoadStoreKind, Offsetting, OperandKind, ReadWriteKind};
-use crate::cpu::move_compare_add_sub::Operation;
+use crate::cpu::move_compare_add_sub::{Operation, ThumbHighRegisterOperation};
 use crate::cpu::single_data_transfer::{SingleDataTransferKind, SingleDataTransferOffsetInfo};
 
 use super::condition::Condition;
@@ -26,7 +26,10 @@ pub enum ArmModeInstruction {
     Multiply,
     MultiplyLong,
     SingleDataSwap,
-    BranchAndExchange(Condition, usize),
+    BranchAndExchange {
+        condition: Condition,
+        register: usize,
+    },
     HalfwordDataTransferRegisterOffset,
     HalfwordDataTransferImmediateOffset,
     SingleDataTransfer {
@@ -115,7 +118,10 @@ impl ArmModeInstruction {
             Self::Multiply => "".to_owned(),
             Self::MultiplyLong => "".to_owned(),
             Self::SingleDataSwap => "".to_owned(),
-            Self::BranchAndExchange(condition, reg) => format!("BX{condition} R{reg}"),
+            Self::BranchAndExchange {
+                condition,
+                register,
+            } => format!("BX{condition} R{register}"),
             Self::HalfwordDataTransferRegisterOffset => "".to_owned(),
             Self::HalfwordDataTransferImmediateOffset => "".to_owned(),
             Self::SingleDataTransfer {
@@ -235,8 +241,11 @@ impl From<u32> for ArmModeInstruction {
         // It can happen `op_code` coalesced into one/two or more than two possible solution, that's because
         // we tried to order with this priority.
         if op_code.get_bits(4..=27) == 0b0001_0010_1111_1111_1111_0001 {
-            let rn = op_code.get_bits(0..=3) as usize;
-            BranchAndExchange(condition, rn)
+            let register = op_code.get_bits(0..=3) as usize;
+            BranchAndExchange {
+                condition,
+                register,
+            }
         } else if op_code.get_bits(23..=27) == 0b00010
             && op_code.get_bits(20..=21) == 0b00
             && op_code.get_bits(4..=11) == 0b0000_1001
@@ -438,9 +447,9 @@ pub enum ThumbModeInstruction {
         rd: u16,
     },
     HiRegisterOpBX {
-        op: u16,
-        reg_source: u16,
-        reg_destination: u16,
+        op: ThumbHighRegisterOperation,
+        source_register: u16,
+        destination_register: u16,
     },
     PCRelativeLoad {
         r_destination: u16,
@@ -461,7 +470,12 @@ pub enum ThumbModeInstruction {
         r_destination: u32,
     },
     LoadStoreImmOffset,
-    LoadStoreHalfword,
+    LoadStoreHalfword {
+        load_store: LoadStoreKind,
+        offset: u16,
+        base_register: u16,
+        source_destination_register: u16,
+    },
     SPRelativeLoadStore {
         load_store: LoadStoreKind,
         r_destination: u16,
@@ -557,18 +571,10 @@ impl ThumbModeInstruction {
             }
             Self::HiRegisterOpBX {
                 op,
-                reg_source,
-                reg_destination,
+                source_register,
+                destination_register,
             } => {
-                let op = match *op {
-                    0b00 => "ADD",
-                    0b01 => "CMP",
-                    0b10 => "MOV",
-                    0b11 => "BX",
-                    _ => unimplemented!(),
-                };
-
-                format!("{op} R{reg_destination}, R{reg_source}")
+                format!("{op} R{destination_register}, R{source_register}")
             }
             Self::PCRelativeLoad {
                 r_destination,
@@ -614,7 +620,19 @@ impl ThumbModeInstruction {
                 format!("{instr} R{r_destination}, [R{r_base}, R{r_offset}]")
             }
             Self::LoadStoreImmOffset => "".to_string(),
-            Self::LoadStoreHalfword => "".to_string(),
+            Self::LoadStoreHalfword {
+                load_store,
+                offset,
+                base_register,
+                source_destination_register,
+            } => {
+                let instr = match load_store {
+                    LoadStoreKind::Load => "LDRH",
+                    LoadStoreKind::Store => "STRH",
+                };
+
+                format!("{instr} R{source_destination_register}, [R{base_register}, #{offset}]")
+            }
             Self::SPRelativeLoadStore {
                 load_store,
                 r_destination,
@@ -680,7 +698,6 @@ impl ThumbModeInstruction {
             }
             Self::Swi => "".to_string(),
             Self::UncondBranch { offset } => {
-                let offset = offset << 1;
                 format!("B #{offset}")
             }
             Self::LongBranchLink { h, offset } => {
@@ -714,17 +731,17 @@ impl From<u16> for ThumbModeInstruction {
 
             AluOp { op, rs, rd }
         } else if op_code.get_bits(10..=15) == 0b010001 {
-            let op = op_code.get_bits(8..=9);
+            let op = op_code.get_bits(8..=9).into();
             let h1 = op_code.get_bit(7);
-            let reg_source = op_code.get_bits(3..=6);
+            let source_register = op_code.get_bits(3..=6);
             let rd_hd = op_code.get_bits(0..=2);
 
-            let reg_destination = if h1 { rd_hd | (1 << 3) } else { rd_hd };
+            let destination_register = if h1 { rd_hd | (1 << 3) } else { rd_hd };
 
             HiRegisterOpBX {
                 op,
-                reg_source,
-                reg_destination,
+                source_register,
+                destination_register,
             }
         } else if op_code.get_bits(12..=15) == 0b1011 && op_code.get_bits(9..=10) == 0b10 {
             let load_store: LoadStoreKind = op_code.get_bit(11).into();
@@ -753,7 +770,7 @@ impl From<u16> for ThumbModeInstruction {
             }
         } else if op_code.get_bits(11..=15) == 0b01001 {
             let r_destination = op_code.get_bits(8..=10);
-            let immediate_value = op_code.get_bits(0..=7);
+            let immediate_value = op_code.get_bits(0..=7) << 2;
 
             PCRelativeLoad {
                 r_destination,
@@ -785,7 +802,17 @@ impl From<u16> for ThumbModeInstruction {
             let offset = (op_code.get_bits(0..=10) << 1) as u32;
             UncondBranch { offset }
         } else if op_code.get_bits(12..=15) == 0b1000 {
-            LoadStoreHalfword
+            let load_store: LoadStoreKind = op_code.get_bit(11).into();
+            let offset = op_code.get_bits(6..=10) << 1;
+            let base_register = op_code.get_bits(3..=5);
+            let source_destination_register = op_code.get_bits(0..=2);
+
+            LoadStoreHalfword {
+                load_store,
+                offset,
+                base_register,
+                source_destination_register,
+            }
         } else if op_code.get_bits(12..=15) == 0b1001 {
             let load_store: LoadStoreKind = op_code.get_bit(11).into();
             let r_destination = op_code.get_bits(8..=10);
@@ -911,7 +938,10 @@ mod tests {
             let cpu = Arm7tdmi::default();
             let output: ArmModeInstruction = cpu.decode(0b1110_0001_0010_1111_1111_1111_0001_0001);
             assert_eq!(
-                ArmModeInstruction::BranchAndExchange(Condition::AL, 1),
+                ArmModeInstruction::BranchAndExchange {
+                    condition: Condition::AL,
+                    register: 1
+                },
                 output
             );
         }
@@ -919,7 +949,10 @@ mod tests {
             let cpu = Arm7tdmi::default();
             let output: ArmModeInstruction = cpu.decode(0b0000_0001_0010_1111_1111_1111_0001_0001);
             assert_eq!(
-                ArmModeInstruction::BranchAndExchange(Condition::EQ, 1),
+                ArmModeInstruction::BranchAndExchange {
+                    condition: Condition::EQ,
+                    register: 1
+                },
                 output
             );
         }
