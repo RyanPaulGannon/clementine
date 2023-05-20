@@ -9,8 +9,8 @@ use crate::memory::lcd_registers::LCDRegisters;
 use crate::memory::timer_registers::TimerRegisters;
 
 use super::interrupts::Interrupts;
-use super::keypad::KeypadInput;
-use super::serial_communication::SerialCommunication2;
+use super::keypad::Keypad;
+use super::serial_communication::SerialBus;
 use super::sound::Sound;
 
 pub struct InternalMemory {
@@ -36,10 +36,10 @@ pub struct InternalMemory {
     timer_registers: TimerRegisters,
 
     /// From 0x04000130 to 0x04000133
-    keypad_input: KeypadInput,
+    keypad_input: Keypad,
 
     /// From 0x04000134 to 0x0400015F
-    serial_communication2: SerialCommunication2,
+    serial_communication2: SerialBus,
 
     /// From 0x04000200 to 040003FE
     interrupts: Interrupts,
@@ -80,15 +80,15 @@ impl Default for InternalMemory {
 impl InternalMemory {
     pub fn new(bios: [u8; 0x00004000], rom: Vec<u8>) -> Self {
         Self {
-            bios_system_rom: bios.into(),
+            bios_system_rom: bios.to_vec(),
             working_ram: vec![0; 0x00040000],
             working_iram: vec![0; 0x00008000],
             lcd_registers: LCDRegisters::default(),
             sound: Sound::default(),
             dma: Dma::new(),
             timer_registers: TimerRegisters::default(),
-            keypad_input: KeypadInput::default(),
-            serial_communication2: SerialCommunication2::default(),
+            keypad_input: Keypad::default(),
+            serial_communication2: SerialBus::default(),
             interrupts: Interrupts::default(),
             bg_palette_ram: vec![0; 0x200],
             obj_palette_ram: vec![0; 0x200],
@@ -96,6 +96,34 @@ impl InternalMemory {
             obj_attributes: vec![0; 0x400],
             rom,
             unused_region: HashMap::new(),
+        }
+    }
+
+    fn read_rom(&self, address: usize) -> u8 {
+        if address < self.rom.len() {
+            self.rom[address]
+        } else {
+            // Preamble:
+            // The GamePak ROM is an halfword addressable memory
+            // and it uses a 16bits bus to trasfer data and a
+            // 24bits(32MB halfword addressed) bus to transfer the address to read.
+            // So technically we can't just read 1 byte from the ROM, we
+            // request the halfword and then we take the upper/lower 8bits
+            // depending on the address least significant bit.
+            //
+            // https://rust-console.github.io/gbatek-gbaonly/#auxgbagamepakbus
+            // In GamePak ROM, the 16bits data and the
+            // lower 16bits of the address are transferred on the same bus (AD0-15),
+            // the higher 8bits of the address (24bits in total, remember halfword addressing)
+            // are transferred via A16-23.
+            // When requesting an address which is "empty", the GamePak ROM doesn't overwrite the
+            // value present in the AD0-15 bus, which then will still contain the lower 16bits of the address.
+            // CPU will then use this as if it was the value read from the ROM.
+            //
+            // Here we get the 24bits address (halfword addressing) by shifting right by 1
+            // and we take only the 16 lower bits. We use this as if it was the value read from the ROM
+            // and we get the 0 or 1 byte depending on the LSB in the address.
+            (((address >> 1) & 0xFFFF) as u16).get_byte((address & 0b1) as u8)
         }
     }
 }
@@ -120,7 +148,10 @@ impl IoDevice for InternalMemory {
             0x05000200..=0x050003FF => self.obj_palette_ram[address - 0x05000200],
             0x06000000..=0x06017FFF => self.video_ram[address - 0x06000000],
             0x07000000..=0x070003FF => self.obj_attributes[address - 0x07000000],
-            0x08000000..=0x0FFFFFFF => self.rom[address - 0x08000000],
+            0x08000000..=0x09FFFFFF => self.read_rom(address - 0x08000000),
+            0x0A000000..=0x0BFFFFFF => self.read_rom(address - 0x0A000000),
+            0x0C000000..=0x0DFFFFFF => self.read_rom(address - 0x0C000000),
+            0x0E000000..=0x0E00FFFF => unimplemented!("SRAM region is unimplemented"),
             0x03008000..=0x03FFFFFF
             | 0x00004000..=0x01FFFFFF
             | 0x10000000..=0xFFFFFFFF
@@ -399,11 +430,21 @@ mod tests {
     #[test]
     fn test_read_rom() {
         let im = InternalMemory {
-            rom: vec![1, 1, 1, 1],
+            rom: vec![1, 2, 3, 4],
             ..Default::default()
         };
         let address = 0x08000000;
         assert_eq!(im.read_at(address), 1);
+
+        // Testing reading in empty rom
+        let address = 0x09FF_FFFF;
+        assert_eq!(im.read_at(address), 0xFF);
+
+        let address = 0x09FF_FFEE;
+        assert_eq!(im.read_at(address), 0xF7);
+
+        let address = 0x09FF_FFEF;
+        assert_eq!(im.read_at(address), 0xFF);
     }
 
     #[test]

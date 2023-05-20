@@ -1,6 +1,5 @@
-use std::fmt::Display;
-
 use crate::bitwise::Bits;
+use crate::cpu::flags::ShiftKind;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ArmModeAluInstruction {
@@ -22,7 +21,7 @@ pub enum ArmModeAluInstruction {
     Mvn = 0xF,
 }
 
-impl Display for ArmModeAluInstruction {
+impl std::fmt::Display for ArmModeAluInstruction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::And => f.write_str("AND"),
@@ -86,94 +85,6 @@ impl From<u32> for ArmModeAluInstruction {
             0xE => Bic,
             0xF => Mvn,
             _ => unreachable!(),
-        }
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-pub enum ThumbModeAluInstruction {
-    And = 0x0,
-    Eor = 0x1,
-    Lsl = 0x2,
-    Lsr = 0x3,
-    Asr = 0x4,
-    Adc = 0x5,
-    Sbc = 0x6,
-    Ror = 0x7,
-    Tst = 0x8,
-    Neg = 0x9,
-    Cmp = 0xA,
-    Cmn = 0xB,
-    Orr = 0xC,
-    Mul = 0xD,
-    Bic = 0xE,
-    Mvn = 0xF,
-}
-
-impl From<u16> for ThumbModeAluInstruction {
-    fn from(alu_op_code: u16) -> Self {
-        use ThumbModeAluInstruction::*;
-        match alu_op_code {
-            0x0 => And,
-            0x1 => Eor,
-            0x2 => Lsl,
-            0x3 => Lsr,
-            0x4 => Asr,
-            0x5 => Adc,
-            0x6 => Sbc,
-            0x7 => Ror,
-            0x8 => Tst,
-            0x9 => Neg,
-            0xA => Cmp,
-            0xB => Cmn,
-            0xC => Orr,
-            0xD => Mul,
-            0xE => Bic,
-            0xF => Mvn,
-            _ => unreachable!(),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ShiftKind {
-    Lsl,
-    Lsr,
-    Asr,
-    Ror,
-}
-
-impl From<u16> for ShiftKind {
-    fn from(op: u16) -> Self {
-        match op {
-            0 => Self::Lsl,
-            1 => Self::Lsr,
-            2 => Self::Asr,
-            3 => Self::Ror,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<u32> for ShiftKind {
-    fn from(op: u32) -> Self {
-        match op {
-            0 => Self::Lsl,
-            1 => Self::Lsr,
-            2 => Self::Asr,
-            3 => Self::Ror,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl Display for ShiftKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Lsl => f.write_str("LSL"),
-            Self::Lsr => f.write_str("LSR"),
-            Self::Asr => f.write_str("ASR"),
-            Self::Ror => f.write_str("ROR"),
         }
     }
 }
@@ -247,6 +158,96 @@ pub fn shift(kind: ShiftKind, shift_amount: u32, rm: u32, carry: bool) -> Arithm
     }
 }
 
+/// Represents the kind of PSR operation
+pub enum PsrOpKind {
+    /// MSR operation (transfer PSR contents to a register)
+    Mrs,
+    /// MSR operation (transfer register contents to PSR)
+    Msr,
+    /// MSR flags operation (transfer register contents or immediate value to PSR flag bits only)
+    MsrFlg,
+}
+
+impl From<u32> for PsrOpKind {
+    fn from(op_code: u32) -> Self {
+        if op_code.get_bits(23..=27) == 0b00010
+            && op_code.get_bits(16..=21) == 0b001111
+            && op_code.get_bits(0..=11) == 0b0000_0000_0000
+        {
+            Self::Mrs
+        } else if op_code.get_bits(23..=27) == 0b00010
+            && op_code.get_bits(12..=21) == 0b10_1001_1111
+            && op_code.get_bits(4..=11) == 0b0000_0000
+        {
+            Self::Msr
+        } else if op_code.get_bits(26..=27) == 0b00
+            && op_code.get_bits(23..=24) == 0b10
+            && op_code.get_bits(12..=21) == 0b10_1000_1111
+        {
+            Self::MsrFlg
+        } else {
+            unreachable!()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShiftOperator {
+    Immediate(u32),
+    Register(u32),
+}
+
+impl std::fmt::Display for ShiftOperator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Immediate(value) => write!(f, "#{value}"),
+            Self::Register(register) => write!(f, "R{register}"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AluSecondOperandInfo {
+    Register {
+        shift_op: ShiftOperator,
+        shift_kind: ShiftKind,
+        register: u32,
+    },
+    Immediate {
+        base: u32,
+        shift: u32,
+    },
+}
+
+impl std::fmt::Display for AluSecondOperandInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Register {
+                shift_op,
+                shift_kind,
+                register,
+            } => {
+                if let ShiftOperator::Immediate(shift) = shift_op {
+                    if shift == 0 {
+                        return if shift_kind == ShiftKind::Lsl {
+                            write!(f, "R{register}")
+                        } else if shift_kind == ShiftKind::Ror {
+                            write!(f, "R{register}, RRX")
+                        } else {
+                            write!(f, "R{register}, {shift_kind} #32")
+                        };
+                    }
+                }
+
+                write!(f, "R{register}, {shift_kind} {shift_op}")
+            }
+            Self::Immediate { base, shift } => {
+                write!(f, "#{}", base.rotate_right(shift))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,17 +267,5 @@ mod tests {
         let instruction_kind = ArmModeAluInstruction::from(alu_op_code).kind();
 
         assert_eq!(instruction_kind, AluInstructionKind::Arithmetic);
-    }
-
-    #[test]
-    fn test_conversion_thumb_alu_op() {
-        let op: ThumbModeAluInstruction = 0b0000.into();
-        assert_eq!(op, ThumbModeAluInstruction::And);
-        let op: ThumbModeAluInstruction = 0b0001.into();
-        assert_eq!(op, ThumbModeAluInstruction::Eor);
-        let op: ThumbModeAluInstruction = 0b1110.into();
-        assert_eq!(op, ThumbModeAluInstruction::Bic);
-        let op: ThumbModeAluInstruction = 0b1111.into();
-        assert_eq!(op, ThumbModeAluInstruction::Mvn);
     }
 }

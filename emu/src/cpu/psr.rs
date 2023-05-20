@@ -1,7 +1,6 @@
 use crate::bitwise::Bits;
+use crate::cpu::arm::alu_instruction::ArithmeticOpResult;
 use crate::cpu::{condition::Condition, cpu_modes::Mode};
-
-use super::alu_instruction::ArithmeticOpResult;
 
 /// Program Status Register.
 #[derive(Default, Clone, Copy)]

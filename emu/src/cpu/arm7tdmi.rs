@@ -1,32 +1,20 @@
 use std::convert::TryInto;
-use std::ops::Mul;
 use std::sync::{Arc, Mutex};
 
 use logger::log;
 
 use crate::bitwise::Bits;
-use crate::cpu::alu_instruction::ShiftKind;
-use crate::cpu::condition::Condition;
+use crate::cpu::arm;
+use crate::cpu::arm::instructions::ArmModeInstruction;
+use crate::cpu::arm::mode::ArmModeOpcode;
 use crate::cpu::cpu_modes::Mode;
-use crate::cpu::instruction::{ArmModeInstruction, ThumbModeInstruction};
-use crate::cpu::move_compare_add_sub::ThumbHighRegisterOperation;
-use crate::cpu::opcode::ArmModeOpcode;
-use crate::cpu::psr::Psr;
+use crate::cpu::psr::{CpuState, Psr};
 use crate::cpu::register_bank::RegisterBank;
+use crate::cpu::thumb::instruction::ThumbModeInstruction;
+use crate::cpu::thumb::mode::ThumbModeOpcode;
 use crate::memory::internal_memory::InternalMemory;
-use crate::memory::io_device::IoDevice;
 
-use super::alu_instruction::{self, ThumbModeAluInstruction};
-use super::flags::{Indexing, LoadStoreKind, Offsetting, OperandKind, ReadWriteKind};
-use super::opcode::ThumbModeOpcode;
-use super::psr::CpuState;
 use super::registers::Registers;
-
-pub const REG_SP: usize = 0xD;
-pub const REG_LR: usize = 0xE;
-pub const REG_PROGRAM_COUNTER: u32 = 0xF;
-pub const SIZE_OF_ARM_INSTRUCTION: u32 = 4;
-pub const SIZE_OF_THUMB_INSTRUCTION: u32 = 2;
 
 pub struct Arm7tdmi {
     pub(crate) memory: Arc<Mutex<InternalMemory>>,
@@ -81,16 +69,17 @@ impl Arm7tdmi {
         <T as TryFrom<V>>::Error: std::fmt::Debug,
     {
         let code = T::try_from(op_code).unwrap();
-        log(format!("{code}"));
+        let pc = self.registers.program_counter();
+
+        log(format!("PC: 0x{pc:X} {code}"));
         code
     }
 
     pub fn execute_arm(&mut self, op_code: ArmModeOpcode) {
-        use ArmModeInstruction::*;
         // Instruction functions should return whether PC has to be advanced
         // after instruction executed.
         let bytes_to_advance = if !self.cpsr.can_execute(op_code.condition) {
-            Some(SIZE_OF_ARM_INSTRUCTION)
+            Some(arm::operations::SIZE_OF_INSTRUCTION)
         } else {
             let decimal_value = self.registers.program_counter();
             let padded_hex_value = format!("{decimal_value:#04X}");
@@ -100,7 +89,7 @@ impl Arm7tdmi {
                 op_code.instruction.disassembler()
             ));
             match op_code.instruction {
-                DataProcessing {
+                ArmModeInstruction::DataProcessing {
                     condition: _,
                     alu_instruction,
                     set_conditions,
@@ -116,16 +105,20 @@ impl Arm7tdmi {
                     rn,
                     destination,
                 ),
-                Multiply => todo!(),
-                MultiplyLong => todo!(),
-                SingleDataSwap => todo!(),
-                BranchAndExchange {
+                ArmModeInstruction::Multiply => todo!(),
+                ArmModeInstruction::MultiplyLong => todo!(),
+                ArmModeInstruction::SingleDataSwap => todo!(),
+                ArmModeInstruction::BranchAndExchange {
                     condition: _,
                     register,
                 } => self.branch_and_exchange(register),
-                HalfwordDataTransferRegisterOffset => self.half_word_data_transfer(op_code),
-                HalfwordDataTransferImmediateOffset => self.half_word_data_transfer(op_code),
-                SingleDataTransfer {
+                ArmModeInstruction::HalfwordDataTransferRegisterOffset => {
+                    self.half_word_data_transfer(op_code)
+                }
+                ArmModeInstruction::HalfwordDataTransferImmediateOffset => {
+                    self.half_word_data_transfer(op_code)
+                }
+                ArmModeInstruction::SingleDataTransfer {
                     condition: _,
                     kind,
                     quantity,
@@ -145,8 +138,8 @@ impl Arm7tdmi {
                     offset_info,
                     offsetting,
                 ),
-                Undefined => todo!(),
-                BlockDataTransfer {
+                ArmModeInstruction::Undefined => todo!(),
+                ArmModeInstruction::BlockDataTransfer {
                     condition: _,
                     indexing,
                     offsetting,
@@ -158,12 +151,12 @@ impl Arm7tdmi {
                 } => self.block_data_transfer(
                     indexing, offsetting, load_psr, write_back, load_store, rn, reg_list,
                 ),
-                Branch {
+                ArmModeInstruction::Branch {
                     condition: _,
                     link,
                     offset,
                 } => self.branch(link, offset),
-                CoprocessorDataTransfer {
+                ArmModeInstruction::CoprocessorDataTransfer {
                     condition: _,
                     indexing,
                     offsetting,
@@ -185,9 +178,9 @@ impl Arm7tdmi {
                     cp_number,
                     offset,
                 ),
-                CoprocessorDataOperation => todo!(),
-                CoprocessorRegisterTrasfer => todo!(),
-                SoftwareInterrupt => todo!(),
+                ArmModeInstruction::CoprocessorDataOperation => todo!(),
+                ArmModeInstruction::CoprocessorRegisterTransfer => todo!(),
+                ArmModeInstruction::SoftwareInterrupt => todo!(),
             }
         };
 
@@ -203,49 +196,52 @@ impl Arm7tdmi {
             padded_hex_value,
             op_code.instruction.disassembler()
         ));
-        use ThumbModeInstruction::*;
         let bytes_to_advance: Option<u32> = match op_code.instruction {
-            MoveShiftedRegister {
-                op,
+            ThumbModeInstruction::MoveShiftedRegister {
+                shift_operation: op,
                 offset5,
-                rs,
-                rd,
-            } => self.move_shifted_reg(op, offset5, rs, rd),
-            AddSubtract {
+                source_register,
+                destination_register,
+            } => self.move_shifted_reg(op, offset5, source_register, destination_register),
+            ThumbModeInstruction::AddSubtract {
                 operation_kind,
                 op,
                 rn_offset3,
-                rs,
-                rd,
+                source_register: rs,
+                destination_register: rd,
             } => self.add_subtract(operation_kind, op, rn_offset3, rs, rd),
-            MoveCompareAddSubtractImm {
-                op,
-                r_destination,
+            ThumbModeInstruction::MoveCompareAddSubtractImm {
+                operation: op,
+                destination_register: r_destination,
                 offset,
             } => self.move_compare_add_sub_imm(op, r_destination, offset),
-            AluOp { op, rs, rd } => self.alu_op(op, rs, rd),
-            HiRegisterOpBX {
-                op,
+            ThumbModeInstruction::AluOp {
+                alu_operation: op,
+                source_register: rs,
+                destination_register: rd,
+            } => self.alu_op(op, rs, rd),
+            ThumbModeInstruction::HiRegisterOpBX {
+                register_operation: op,
                 source_register,
                 destination_register,
             } => self.hi_reg_operation_branch_ex(op, source_register, destination_register),
-            PCRelativeLoad {
-                r_destination,
+            ThumbModeInstruction::PCRelativeLoad {
+                destination_register: r_destination,
                 immediate_value,
             } => self.pc_relative_load(r_destination, immediate_value),
-            LoadStoreRegisterOffset {
+            ThumbModeInstruction::LoadStoreRegisterOffset {
                 load_store,
                 byte_word,
                 ro,
-                rb,
-                rd,
+                base_register: rb,
+                destination_register: rd,
             } => self.load_store_register_offset(load_store, byte_word, ro, rb, rd),
-            LoadStoreSignExtByteHalfword {
-                h_flag,
+            ThumbModeInstruction::LoadStoreSignExtByteHalfword {
+                h: h_flag,
                 sign_extend_flag,
-                r_offset,
-                r_base,
-                r_destination,
+                offset_register: r_offset,
+                base_register: r_base,
+                destination_register: r_destination,
             } => self.load_store_sign_extend_byte_halfword(
                 h_flag,
                 sign_extend_flag,
@@ -253,8 +249,8 @@ impl Arm7tdmi {
                 r_base,
                 r_destination,
             ),
-            LoadStoreImmOffset => self.load_store_immediate_offset(op_code),
-            LoadStoreHalfword {
+            ThumbModeInstruction::LoadStoreImmOffset => self.load_store_immediate_offset(op_code),
+            ThumbModeInstruction::LoadStoreHalfword {
                 load_store,
                 offset,
                 base_register,
@@ -265,34 +261,34 @@ impl Arm7tdmi {
                 base_register,
                 source_destination_register,
             ),
-            SPRelativeLoadStore {
+            ThumbModeInstruction::SPRelativeLoadStore {
                 load_store,
-                r_destination,
+                destination_register: r_destination,
                 word8,
             } => self.sp_relative_load_store(load_store, r_destination, word8),
-            LoadAddress {
+            ThumbModeInstruction::LoadAddress {
                 sp,
-                r_destination,
+                destination_register: r_destination,
                 offset,
             } => self.load_address(sp, r_destination.try_into().unwrap(), offset),
-            AddOffsetSP { s, word7 } => self.add_offset_sp(s, word7),
-            PushPopReg {
+            ThumbModeInstruction::AddOffsetSP { s, word7 } => self.add_offset_sp(s, word7),
+            ThumbModeInstruction::PushPopReg {
                 load_store,
                 pc_lr,
                 register_list,
             } => self.push_pop_register(load_store, pc_lr, register_list),
-            MultipleLoadStore {
+            ThumbModeInstruction::MultipleLoadStore {
                 load_store,
                 base_register,
                 register_list,
             } => self.multiple_load_store(load_store, base_register as usize, register_list),
-            CondBranch {
+            ThumbModeInstruction::CondBranch {
                 condition,
                 immediate_offset,
             } => self.cond_branch(condition, immediate_offset),
-            Swi => unimplemented!(),
-            UncondBranch { offset } => self.uncond_branch(offset),
-            LongBranchLink { h, offset } => self.long_branch_link(h, offset),
+            ThumbModeInstruction::Swi => unimplemented!(),
+            ThumbModeInstruction::UncondBranch { offset } => self.uncond_branch(offset),
+            ThumbModeInstruction::LongBranchLink { h, offset } => self.long_branch_link(h, offset),
         };
 
         self.registers
@@ -324,9 +320,7 @@ impl Arm7tdmi {
             }
         }
     }
-}
 
-impl Arm7tdmi {
     pub fn new(memory: Arc<Mutex<InternalMemory>>) -> Self {
         Self {
             memory,
@@ -342,347 +336,6 @@ impl Arm7tdmi {
             Mode::Abort => self.register_bank.spsr_abt,
             Mode::Supervisor => self.register_bank.spsr_svc,
             Mode::Undefined => self.register_bank.spsr_und
-        }
-    }
-
-    fn load_store_sign_extend_byte_halfword(
-        &mut self,
-        h_flag: bool,
-        sign_extend_flag: bool,
-        r_offset: u32,
-        r_base: u32,
-        r_destination: u32,
-    ) -> Option<u32> {
-        let offset = self.registers.register_at(r_offset.try_into().unwrap());
-        let base = self.registers.register_at(r_base.try_into().unwrap());
-        let address: usize = base.wrapping_add(offset).try_into().unwrap();
-
-        match (sign_extend_flag, h_flag) {
-            // Store halfword
-            (false, false) => {
-                let value = self
-                    .registers
-                    .register_at(r_destination.try_into().unwrap());
-
-                self.memory
-                    .lock()
-                    .unwrap()
-                    .write_half_word(address, value as u16);
-            }
-            // Load halfword
-            (false, true) => {
-                let value = self.memory.lock().unwrap().read_half_word(address);
-
-                self.registers
-                    .set_register_at(r_destination.try_into().unwrap(), value as u32);
-            }
-            // Load sign-extended byte
-            (true, false) => {
-                let mut value = self.memory.lock().unwrap().read_at(address) as u32;
-                value = value.sign_extended(8);
-
-                self.registers
-                    .set_register_at(r_destination.try_into().unwrap(), value);
-            }
-            // Load sign-extended halfword
-            (true, true) => {
-                let mut value = self.memory.lock().unwrap().read_half_word(address) as u32;
-                value = value.sign_extended(16);
-
-                self.registers
-                    .set_register_at(r_destination.try_into().unwrap(), value);
-            }
-        }
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn load_store_halfword(
-        &mut self,
-        load_store: LoadStoreKind,
-        offset: u16,
-        base_register: u16,
-        source_destination_register: u16,
-    ) -> Option<u32> {
-        let rb = self
-            .registers
-            .register_at(base_register.try_into().unwrap());
-        let address: usize = rb.wrapping_add(offset as u32).try_into().unwrap();
-        let mut mem = self.memory.lock().unwrap();
-
-        match load_store {
-            LoadStoreKind::Load => {
-                self.registers.set_register_at(
-                    source_destination_register as usize,
-                    mem.read_half_word(address) as u32,
-                );
-            }
-            LoadStoreKind::Store => {
-                mem.write_half_word(
-                    address,
-                    self.registers
-                        .register_at(source_destination_register as usize)
-                        as u16,
-                );
-            }
-        }
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn cond_branch(&mut self, condition: Condition, immediate_offset: i32) -> Option<u32> {
-        if self.cpsr.can_execute(condition) {
-            let pc = self.registers.program_counter() as i32;
-            let new_pc = pc + 4 + immediate_offset;
-            self.registers.set_program_counter(new_pc as u32);
-            log("cond branch can execute");
-            None
-        } else {
-            Some(SIZE_OF_THUMB_INSTRUCTION)
-        }
-    }
-
-    fn uncond_branch(&mut self, offset: u32) -> Option<u32> {
-        let offset = offset.sign_extended(12) as i32;
-        let pc = self.registers.program_counter() as i32 + 4; // NOTE: Emulating prefetch with this +4.
-        let new_pc = pc + offset;
-        self.registers.set_program_counter(new_pc as u32);
-
-        None
-    }
-
-    fn add_subtract(
-        &mut self,
-        operation_kind: OperandKind,
-        op: bool,
-        rn_offset3: u16,
-        rs: u16,
-        rd: u16,
-    ) -> Option<u32> {
-        let rs = self.registers.register_at(rs.try_into().unwrap());
-        let offset = match operation_kind {
-            OperandKind::Immediate => rn_offset3 as u32,
-            OperandKind::Register => self.registers.register_at(rn_offset3.try_into().unwrap()),
-        };
-
-        match op {
-            // Add
-            false => {
-                let add_result = Self::add_inner_op(rs, offset);
-                self.registers
-                    .set_register_at(rd as usize, add_result.result);
-                self.cpsr.set_flags(add_result);
-            }
-            // Sub
-            true => {
-                let sub_result = Self::sub_inner_op(rs, offset);
-                self.registers
-                    .set_register_at(rd as usize, sub_result.result);
-                self.cpsr.set_flags(sub_result);
-            }
-        };
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn load_store_register_offset(
-        &mut self,
-        load_store: LoadStoreKind,
-        byte_word: ReadWriteKind,
-        offset_register: u16,
-        base_register: u16,
-        source_desitination_register: u16,
-    ) -> Option<u32> {
-        let ro = self
-            .registers
-            .register_at(offset_register.try_into().unwrap());
-        let rb = self
-            .registers
-            .register_at(base_register.try_into().unwrap());
-        let address: usize = rb.wrapping_add(ro).try_into().unwrap();
-        let mut mem = self.memory.lock().unwrap();
-        let rd: usize = source_desitination_register.try_into().unwrap();
-        match (load_store, byte_word) {
-            (LoadStoreKind::Store, ReadWriteKind::Byte) => {
-                let rd = (self.registers.register_at(rd) & 0xFF) as u8;
-                mem.write_at(address, rd);
-            }
-            (LoadStoreKind::Store, ReadWriteKind::Word) => {
-                let rd = self.registers.register_at(rd);
-                mem.write_word(address, rd);
-            }
-            (LoadStoreKind::Load, ReadWriteKind::Byte) => {
-                let value = mem.read_at(address);
-                self.registers.set_register_at(rd, value as u32);
-            }
-            (LoadStoreKind::Load, ReadWriteKind::Word) => {
-                let value = mem.read_word(address);
-                self.registers.set_register_at(rd, value);
-            }
-        };
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn load_store_immediate_offset(&mut self, op_code: ThumbModeOpcode) -> Option<u32> {
-        let byte_word: ReadWriteKind = op_code.get_bit(12).into();
-        let load_store: LoadStoreKind = op_code.get_bit(11).into();
-        let offset5 = op_code.get_bits(6..=10) as u32;
-        let offset = offset5
-            << match byte_word {
-                ReadWriteKind::Word => 2,
-                ReadWriteKind::Byte => 0,
-            };
-
-        let rb = op_code.get_bits(3..=5);
-        let rd = op_code.get_bits(0..=2);
-
-        let base = self.registers.register_at(rb.try_into().unwrap());
-        let address = base.wrapping_add(offset);
-
-        let mut mem = self.memory.lock().unwrap();
-        match (load_store, byte_word) {
-            (LoadStoreKind::Store, ReadWriteKind::Word) => {
-                let v = self.registers.register_at(rd.try_into().unwrap());
-                mem.write_word(address.try_into().unwrap(), v)
-            }
-            (LoadStoreKind::Store, ReadWriteKind::Byte) => {
-                let v = self.registers.register_at(rd.try_into().unwrap());
-                mem.write_at(address.try_into().unwrap(), v as u8)
-            }
-            (LoadStoreKind::Load, ReadWriteKind::Word) => {
-                let v = mem.read_word(address.try_into().unwrap());
-                self.registers.set_register_at(rd.try_into().unwrap(), v);
-            }
-            (LoadStoreKind::Load, ReadWriteKind::Byte) => todo!(),
-        }
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn branch_and_exchange(&mut self, register: usize) -> Option<u32> {
-        let mut rn = self.registers.register_at(register);
-        let state: CpuState = rn.get_bit(0).into();
-        self.cpsr.set_cpu_state(state);
-
-        match self.cpsr.cpu_state() {
-            CpuState::Thumb => rn.set_bit_off(0),
-            CpuState::Arm => {
-                rn.set_bit_off(0);
-                rn.set_bit_off(1);
-            }
-        }
-
-        self.registers.set_program_counter(rn);
-
-        None
-    }
-
-    fn half_word_data_transfer(&mut self, op_code: ArmModeOpcode) -> Option<u32> {
-        let indexing: Indexing = op_code.get_bit(24).into();
-        let offsetting: Offsetting = op_code.get_bit(23).into();
-        let write_back = op_code.get_bit(21);
-        let load_store: LoadStoreKind = op_code.get_bit(20).into();
-        let rn_base_register = op_code.get_bits(16..=19);
-        let rd_source_destination_register = op_code.get_bits(12..=15);
-        let transfer_type = HalfwordTransferType::from(op_code.get_bits(5..=6) as u8);
-
-        let operand_kind: OperandKind = op_code.get_bit(22).into();
-
-        let offset = match operand_kind {
-            OperandKind::Immediate => {
-                let immediate_offset_high = op_code.get_bits(8..=11);
-                let immediate_offset_low = op_code.get_bits(0..=3);
-                (immediate_offset_high << 4) | immediate_offset_low
-            }
-            OperandKind::Register => {
-                let rm: usize = op_code.get_bits(0..=3).try_into().unwrap();
-                self.registers.register_at(rm)
-            }
-        };
-
-        let mut address = self
-            .registers
-            .register_at(rn_base_register.try_into().unwrap());
-
-        if rn_base_register == REG_PROGRAM_COUNTER {
-            // prefetching
-            address = address.wrapping_add(8);
-
-            if write_back {
-                panic!("WriteBack should not be specified when using R15 as base register.");
-            }
-
-            if indexing == Indexing::Post {
-                panic!("Post indexing uses write back but we're using R15 as base register.
-                Documentation says that when using R15 as base register WB should not be used. What should we do?");
-            }
-        }
-
-        let effective = match offsetting {
-            Offsetting::Down => address.wrapping_sub(offset),
-            Offsetting::Up => address.wrapping_add(offset),
-        };
-
-        let address: usize = match indexing {
-            Indexing::Pre => effective.try_into().unwrap(),
-            Indexing::Post => address.try_into().unwrap(),
-        };
-
-        let mut mem = self.memory.lock().unwrap();
-
-        match load_store {
-            LoadStoreKind::Store => {
-                let value = if rd_source_destination_register == REG_PROGRAM_COUNTER {
-                    let pc: u32 = self.registers.program_counter().try_into().unwrap();
-                    pc + 12
-                } else {
-                    self.registers
-                        .register_at(rd_source_destination_register as usize)
-                };
-
-                match transfer_type {
-                    HalfwordTransferType::UnsignedHalfwords => {
-                        mem.write_at(address, value.get_bits(0..=7) as u8);
-                        mem.write_at(address + 1, value.get_bits(8..=15) as u8);
-                    }
-                    _ => unreachable!("HS flags can't be != from 01 for STORE (L=0)"),
-                };
-            }
-            LoadStoreKind::Load => match transfer_type {
-                HalfwordTransferType::UnsignedHalfwords => {
-                    let v = mem.read_half_word(address);
-                    self.registers
-                        .set_register_at(rd_source_destination_register as usize, v.into());
-                }
-                HalfwordTransferType::SignedByte => {
-                    let v = mem.read_at(address) as u32;
-                    self.registers.set_register_at(
-                        rd_source_destination_register as usize,
-                        v.sign_extended(8),
-                    );
-                }
-                HalfwordTransferType::SignedHalfwords => {
-                    let v = mem.read_half_word(address) as u32;
-                    self.registers.set_register_at(
-                        rd_source_destination_register as usize,
-                        v.sign_extended(16),
-                    );
-                }
-            },
-        }
-
-        if indexing == Indexing::Post || write_back {
-            self.registers
-                .set_register_at(rn_base_register.try_into().unwrap(), effective);
-        }
-
-        if !(load_store == LoadStoreKind::Load
-            && rd_source_destination_register == REG_PROGRAM_COUNTER)
-        {
-            Some(SIZE_OF_ARM_INSTRUCTION)
-        } else {
-            None
         }
     }
 
@@ -806,478 +459,6 @@ impl Arm7tdmi {
 
         self.cpsr.set_mode(new_mode);
     }
-
-    fn branch(&mut self, is_link: bool, offset: u32) -> Option<u32> {
-        let offset = offset.sign_extended(26) as i32;
-        let old_pc: u32 = self.registers.program_counter().try_into().unwrap();
-        if is_link {
-            self.registers
-                .set_register_at(14, old_pc.wrapping_add(SIZE_OF_ARM_INSTRUCTION));
-        }
-
-        // 8 is for the prefetch
-        let new_pc = self.registers.program_counter() as i32 + offset + 8;
-        self.registers.set_program_counter(new_pc as u32);
-
-        // Never advance PC after B
-        None
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn block_data_transfer(
-        &mut self,
-        indexing: Indexing,
-        offsetting: Offsetting,
-        load_psr: bool,
-        write_back: bool,
-        load_store: LoadStoreKind,
-        rn: u32,
-        reg_list: u32,
-    ) -> Option<u32> {
-        let base_register = rn.try_into().unwrap();
-        let memory_base = self.registers.register_at(base_register);
-        let mut address = memory_base.try_into().unwrap();
-
-        if load_psr {
-            unimplemented!();
-        }
-
-        let transfer = match load_store {
-            LoadStoreKind::Store => {
-                |arm: &mut Self, address: usize, reg_source: usize| {
-                    let mut value = arm.registers.register_at(reg_source);
-
-                    // If R15 we get the value of the current instruction + 12
-                    if reg_source == REG_PROGRAM_COUNTER.try_into().unwrap() {
-                        value += 12;
-                    }
-                    let mut memory = arm.memory.lock().unwrap();
-
-                    memory.write_at(address, value.get_bits(0..=7) as u8);
-                    memory.write_at(address + 1, value.get_bits(8..=15) as u8);
-                    memory.write_at(address + 2, value.get_bits(16..=23) as u8);
-                    memory.write_at(address + 3, value.get_bits(24..=31) as u8);
-                }
-            }
-            LoadStoreKind::Load => |arm: &mut Self, address: usize, reg_destination: usize| {
-                let memory = arm.memory.lock().unwrap();
-                let part_0: u32 = memory.read_at(address).try_into().unwrap();
-                let part_1: u32 = memory.read_at(address + 1).try_into().unwrap();
-                let part_2: u32 = memory.read_at(address + 2).try_into().unwrap();
-                let part_3: u32 = memory.read_at(address + 3).try_into().unwrap();
-                drop(memory);
-                let v = part_3 << 24_u32 | part_2 << 16_u32 | part_1 << 8_u32 | part_0;
-                arm.registers.set_register_at(reg_destination, v);
-            },
-        };
-
-        self.exec_data_transfer(reg_list, indexing, &mut address, offsetting, transfer);
-
-        if write_back {
-            self.registers
-                .set_register_at(base_register, address.try_into().unwrap());
-        };
-
-        // If LDM and R15 is in register list we don't advance PC
-        if !(load_store == LoadStoreKind::Load && reg_list.is_bit_on(15)) {
-            Some(SIZE_OF_ARM_INSTRUCTION)
-        } else {
-            None
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn coprocessor_data_transfer(
-        &mut self,
-        indexing: Indexing,
-        offsetting: Offsetting,
-        _transfer_length: bool,
-        _write_back: bool,
-        _load_store: LoadStoreKind,
-        rn: u32,
-        _crd: u32,
-        _cp_number: u32,
-        offset: u32,
-    ) -> Option<u32> {
-        let mut _address = self.registers.register_at(rn.try_into().unwrap());
-        let effective = match offsetting {
-            Offsetting::Down => _address.wrapping_sub(offset),
-            Offsetting::Up => _address.wrapping_add(offset),
-        };
-
-        let _address = match indexing {
-            Indexing::Pre => effective,
-            Indexing::Post => _address,
-        };
-
-        // TODO: take a look if we need to finish this for real.
-        todo!("finish this");
-        // Some(SIZE_OF_ARM_INSTRUCTION)
-    }
-
-    fn exec_data_transfer<F>(
-        &mut self,
-        reg_list: u32,
-        indexing: Indexing,
-        address: &mut usize,
-        offsetting: Offsetting,
-        transfer: F,
-    ) where
-        F: Fn(&mut Self, usize, usize),
-    {
-        let alignment = 4; // Since are word, the alignment is 4.
-
-        let change_address = |address: usize| match offsetting {
-            Offsetting::Down => address.wrapping_sub(alignment),
-            Offsetting::Up => address.wrapping_add(alignment),
-        };
-
-        // If we are decreasing we still want to store the lowest reg to the lowest
-        // memory address. For this reason we reverse the loop order.
-        let range_registers: Box<dyn Iterator<Item = u8>> = match offsetting {
-            Offsetting::Down => Box::new((0..=15).rev()),
-            Offsetting::Up => Box::new(0..=15),
-        };
-
-        for reg_source in range_registers {
-            if reg_list.is_bit_on(reg_source) {
-                if indexing == Indexing::Pre {
-                    *address = change_address(*address);
-                }
-
-                transfer(self, *address, reg_source.into());
-
-                if indexing == Indexing::Post {
-                    *address = change_address(*address);
-                }
-            }
-        }
-    }
-
-    pub fn pc_relative_load(&mut self, r_destination: u16, immediate_value: u16) -> Option<u32> {
-        let mut pc = self.registers.program_counter() as u32;
-        // word alignment
-        pc.set_bit_off(1);
-        pc.set_bit_off(0);
-        let address = pc as usize + 4_usize + immediate_value as usize;
-        let value = self.memory.lock().unwrap().read_word(address);
-        let dest = r_destination.try_into().unwrap();
-        self.registers.set_register_at(dest, value);
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    pub(crate) fn hi_reg_operation_branch_ex(
-        &mut self,
-        op: ThumbHighRegisterOperation,
-        reg_source: u16,
-        reg_destination: u16,
-    ) -> Option<u32> {
-        let d_value = self.registers.register_at(reg_destination as usize);
-        let s_value = self.registers.register_at(reg_source as usize);
-
-        match op {
-            ThumbHighRegisterOperation::Add => {
-                let r = d_value.wrapping_add(s_value);
-                self.registers.set_register_at(reg_destination as usize, r);
-
-                if reg_destination == REG_PROGRAM_COUNTER as u16 {
-                    self.registers.set_program_counter(r + 4);
-                    None
-                } else {
-                    Some(SIZE_OF_THUMB_INSTRUCTION)
-                }
-            }
-            ThumbHighRegisterOperation::Cmp => {
-                let first_op = d_value
-                    + match reg_destination as u32 {
-                        REG_PROGRAM_COUNTER => 4,
-                        _ => 0,
-                    };
-
-                let second_op = s_value
-                    + match reg_source as u32 {
-                        REG_PROGRAM_COUNTER => 4,
-                        _ => 0,
-                    };
-
-                let sub_result = Self::sub_inner_op(first_op, second_op);
-
-                self.cpsr.set_flags(sub_result);
-
-                Some(SIZE_OF_THUMB_INSTRUCTION)
-            }
-            ThumbHighRegisterOperation::Mov => {
-                let second_op = s_value
-                    + match reg_source as u32 {
-                        REG_PROGRAM_COUNTER => 4,
-                        _ => 0,
-                    };
-
-                self.registers
-                    .set_register_at(reg_destination as usize, second_op);
-
-                if reg_destination == REG_PROGRAM_COUNTER as u16 {
-                    None
-                } else {
-                    Some(SIZE_OF_THUMB_INSTRUCTION)
-                }
-            }
-            ThumbHighRegisterOperation::BxOrBlx => {
-                let value = s_value
-                    + match reg_source as u32 {
-                        REG_PROGRAM_COUNTER => 4,
-                        _ => 0,
-                    };
-                let new_state = value.get_bit(0);
-                self.cpsr.set_cpu_state(new_state.into());
-                let new_pc = value & !1;
-                self.registers.set_program_counter(new_pc);
-
-                None
-            }
-        }
-    }
-
-    pub(crate) fn push_pop_register(
-        &mut self,
-        load_store: LoadStoreKind,
-        pc_lr: bool,
-        register_list: u16,
-    ) -> Option<u32> {
-        let mut reg_sp = self.registers.register_at(REG_SP);
-        let mut memory = self.memory.lock().unwrap();
-
-        match load_store {
-            LoadStoreKind::Store => {
-                if pc_lr {
-                    reg_sp -= 4;
-                    memory.write_word(
-                        reg_sp.try_into().unwrap(),
-                        self.registers.register_at(REG_LR),
-                    );
-                }
-
-                for r in (0..=7).rev() {
-                    if register_list.get_bit(r) {
-                        reg_sp -= 4;
-                        memory.write_word(
-                            reg_sp.try_into().unwrap(),
-                            self.registers.register_at(r.into()),
-                        );
-                    }
-                }
-            }
-            LoadStoreKind::Load => {
-                for r in 0..=7 {
-                    if register_list.get_bit(r) {
-                        self.registers.set_register_at(
-                            r.try_into().unwrap(),
-                            memory.read_word(reg_sp.try_into().unwrap()),
-                        );
-
-                        reg_sp += 4;
-                    }
-                }
-
-                if pc_lr {
-                    self.registers
-                        .set_program_counter(memory.read_word(reg_sp.try_into().unwrap()));
-
-                    reg_sp += 4;
-                }
-            }
-        }
-
-        self.registers.set_register_at(REG_SP, reg_sp);
-
-        if load_store == LoadStoreKind::Load && pc_lr {
-            None
-        } else {
-            Some(SIZE_OF_THUMB_INSTRUCTION)
-        }
-    }
-
-    pub(crate) fn multiple_load_store(
-        &mut self,
-        load_store: LoadStoreKind,
-        base_register: usize,
-        register_list: u16,
-    ) -> Option<u32> {
-        let mut address = self.registers.register_at(base_register);
-
-        match load_store {
-            LoadStoreKind::Store => {
-                for r in 0..=7 {
-                    if register_list.is_bit_on(r) {
-                        let value = self.registers.register_at(r as usize);
-                        self.memory
-                            .lock()
-                            .unwrap()
-                            .write_word(address as usize, value);
-
-                        address += 4;
-                    }
-                }
-            }
-            LoadStoreKind::Load => {
-                for r in 0..=7 {
-                    if register_list.get_bit(r) {
-                        let value = self.memory.lock().unwrap().read_word(address as usize);
-                        self.registers.set_register_at(r as usize, value);
-
-                        address += 4;
-                    }
-                }
-            }
-        }
-
-        self.registers.set_register_at(base_register, address);
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn add_offset_sp(&mut self, s: bool, word7: u16) -> Option<u32> {
-        let value = (word7 as i32).mul(if s { -1 } else { 1 });
-        let old_sp = self.registers.register_at(REG_SP) as i32;
-        let new_sp = old_sp + value;
-
-        self.registers.set_register_at(REG_SP, new_sp as u32);
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn sp_relative_load_store(
-        &mut self,
-        load_store: LoadStoreKind,
-        r_destination: u16,
-        word8: u16,
-    ) -> Option<u32> {
-        let address = self.registers.register_at(REG_SP) + (word8 as u32);
-
-        let rd = r_destination.try_into().unwrap();
-        match load_store {
-            LoadStoreKind::Load => {
-                self.registers.set_register_at(
-                    rd,
-                    self.memory
-                        .lock()
-                        .unwrap()
-                        .read_word(address.try_into().unwrap()),
-                );
-            }
-            LoadStoreKind::Store => {
-                self.memory
-                    .lock()
-                    .unwrap()
-                    .write_word(address.try_into().unwrap(), self.registers.register_at(rd));
-            }
-        }
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn load_address(&mut self, sp: bool, r_destination: usize, offset: u32) -> Option<u32> {
-        let v = if sp {
-            let stack_pointer = self.registers.register_at(REG_SP);
-            stack_pointer.wrapping_add(offset)
-        } else {
-            let pc = self.registers.program_counter() as u32;
-            let mut pc = pc.wrapping_add(4);
-            pc.set_bit_off(0);
-            pc.wrapping_add(offset)
-        };
-
-        self.registers.set_register_at(r_destination, v);
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn alu_op(&mut self, op: ThumbModeAluInstruction, rs: u16, rd: u16) -> Option<u32> {
-        let rs = self.registers.register_at(rs.try_into().unwrap());
-        match op {
-            ThumbModeAluInstruction::And => self.and(
-                rd.into(),
-                self.registers.register_at(rd.try_into().unwrap()),
-                rs,
-                true,
-            ),
-            ThumbModeAluInstruction::Eor => todo!(),
-            ThumbModeAluInstruction::Lsl => todo!(),
-            ThumbModeAluInstruction::Lsr => todo!(),
-            ThumbModeAluInstruction::Asr => todo!(),
-            ThumbModeAluInstruction::Adc => todo!(),
-            ThumbModeAluInstruction::Sbc => todo!(),
-            ThumbModeAluInstruction::Ror => todo!(),
-            ThumbModeAluInstruction::Tst => {
-                self.tst(self.registers.register_at(rd.try_into().unwrap()), rs)
-            }
-            ThumbModeAluInstruction::Neg => todo!(),
-            ThumbModeAluInstruction::Cmp => {
-                self.cmp(self.registers.register_at(rd.try_into().unwrap()), rs)
-            }
-            ThumbModeAluInstruction::Cmn => todo!(),
-            ThumbModeAluInstruction::Orr => self.orr(
-                rd.into(),
-                self.registers.register_at(rd.try_into().unwrap()),
-                rs,
-                true,
-            ),
-            ThumbModeAluInstruction::Mul => self.mul(
-                rd.into(),
-                rs,
-                self.registers.register_at(rd.try_into().unwrap()),
-            ),
-            ThumbModeAluInstruction::Bic => todo!(),
-            ThumbModeAluInstruction::Mvn => {
-                self.mvn(rd.try_into().unwrap(), rs, true);
-            }
-        }
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
-
-    fn long_branch_link(&mut self, h: bool, offset: u32) -> Option<u32> {
-        if h {
-            let offset = offset << 1;
-
-            let next_instruction =
-                self.registers.program_counter() as u32 + SIZE_OF_THUMB_INSTRUCTION;
-            let lr = self.registers.register_at(REG_LR);
-
-            self.registers.set_program_counter(lr.wrapping_add(offset));
-            self.registers.set_register_at(REG_LR, next_instruction | 1);
-            None
-        } else {
-            let offset = offset << 12;
-            let offset = offset.sign_extended(23);
-
-            let pc = self.registers.program_counter() as u32
-                + SIZE_OF_THUMB_INSTRUCTION
-                + SIZE_OF_THUMB_INSTRUCTION;
-            self.registers
-                .set_register_at(REG_LR, pc.wrapping_add(offset));
-            Some(SIZE_OF_THUMB_INSTRUCTION)
-        }
-    }
-
-    pub(crate) fn move_shifted_reg(
-        &mut self,
-        op: ShiftKind,
-        offset5: u16,
-        rs: u16,
-        rd: u16,
-    ) -> Option<u32> {
-        let source = self.registers.register_at(rs.try_into().unwrap());
-        let r = alu_instruction::shift(op, offset5.into(), source, self.cpsr.carry_flag());
-        self.registers
-            .set_register_at(rd.try_into().unwrap(), r.result);
-
-        self.cpsr.set_carry_flag(r.carry);
-        self.cpsr.set_zero_flag(r.result == 0);
-        self.cpsr.set_sign_flag(r.result.get_bit(31));
-
-        Some(SIZE_OF_THUMB_INSTRUCTION)
-    }
 }
 
 pub enum HalfwordTransferType {
@@ -1300,64 +481,16 @@ impl From<u8> for HalfwordTransferType {
 #[cfg(test)]
 mod tests {
     use crate::cpu::condition::Condition;
-    use crate::cpu::instruction::ArmModeInstruction::{Branch, BranchAndExchange};
+    use crate::cpu::flags::LoadStoreKind;
+    use crate::cpu::registers::{REG_LR, REG_PROGRAM_COUNTER, REG_SP};
+    use crate::cpu::thumb::instruction::ThumbModeInstruction;
+    use crate::memory::io_device::IoDevice;
     use pretty_assertions::assert_eq;
 
     use super::*;
 
     #[test]
-    fn check_branch_and_exchange() {
-        {
-            let op_code = 0b1110_0_0_0_1_0_0_1_0_1_1_1_1_1_1_1_1_1_1_1_1_0_0_0_1_0000;
-            let cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                BranchAndExchange {
-                    condition: Condition::AL,
-                    register: 0
-                }
-            );
-            let asm = op_code.instruction.disassembler();
-            assert_eq!(asm, "BX R0");
-        }
-    }
-
-    #[test]
     fn check_branch() {
-        {
-            let op_code = 0b0000_101_0_111111111111111111100011;
-            let cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                Branch {
-                    condition: Condition::EQ,
-                    link: false,
-                    offset: 0x3FFFF8C,
-                }
-            );
-
-            assert!(!cpu.cpsr.can_execute(op_code.condition));
-            let asm = op_code.instruction.disassembler();
-            assert_eq!(asm, "BEQ 0x03FFFF8C");
-        }
-        {
-            let op_code = 0b1110_101_1_000000000000000000001111;
-            let cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                Branch {
-                    condition: Condition::AL,
-                    link: true,
-                    offset: 60,
-                }
-            );
-            let asm = op_code.instruction.disassembler();
-            assert_eq!(asm, "BL 0x0000003C");
-        }
-
         // Covers a positive offset
 
         // 15(1111b) << 2 = 60 bytes
@@ -1758,13 +891,6 @@ mod tests {
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b0100_1001_0101_1000_u16;
         let op_code: ThumbModeOpcode = cpu.decode(op_code);
-        assert_eq!(
-            op_code.instruction,
-            ThumbModeInstruction::PCRelativeLoad {
-                r_destination: 1,
-                immediate_value: 352,
-            }
-        );
 
         cpu.registers.set_register_at(1, 10);
         cpu.memory.lock().unwrap().write_at(356, 1);
@@ -1781,16 +907,6 @@ mod tests {
             let op_code = 0b0101_00_0_000_001_010;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
 
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::LoadStoreRegisterOffset {
-                    load_store: LoadStoreKind::Store,
-                    byte_word: Default::default(),
-                    ro: 0,
-                    rb: 1,
-                    rd: 2,
-                }
-            );
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 100);
             cpu.registers.set_register_at(2, 0xFEEFAC1F);
@@ -1967,10 +1083,6 @@ mod tests {
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b1110_0001_0010_1111;
         let op_code: ThumbModeOpcode = cpu.decode(op_code);
-        assert_eq!(
-            op_code.instruction,
-            ThumbModeInstruction::UncondBranch { offset: 606 }
-        );
 
         cpu.registers.set_program_counter(1000);
 
@@ -1986,22 +1098,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code: u16 = 0b0100_0111_0111_0000;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::HiRegisterOpBX {
-                    op: ThumbHighRegisterOperation::BxOrBlx,
-                    source_register: 14,
-                    destination_register: 0,
-                }
-            );
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::HiRegisterOpBX {
-                    op: ThumbHighRegisterOperation::BxOrBlx,
-                    source_register: 14,
-                    destination_register: 0,
-                }
-            );
 
             cpu.registers.set_register_at(14, 123);
             cpu.execute_thumb(op_code);
@@ -2199,19 +1295,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1011_0101_1111_0000;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::PushPopReg {
-                    load_store: LoadStoreKind::Store,
-                    pc_lr: true,
-                    register_list: 240,
-                }
-            );
-
-            assert_eq!(
-                op_code.instruction.disassembler(),
-                "PUSH {R4, R5, R6, R7, PC}"
-            );
 
             cpu.registers.set_program_counter(1000);
             cpu.registers.set_register_at(REG_LR, 1000);
@@ -2330,14 +1413,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0011_0110_0000;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::AluOp {
-                    op: ThumbModeAluInstruction::Mul,
-                    rs: 4,
-                    rd: 0,
-                }
-            );
 
             cpu.cpsr.set_sign_flag(true);
             cpu.cpsr.set_zero_flag(true);
@@ -2354,15 +1429,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0000_0001_1000;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::AluOp {
-                    op: ThumbModeAluInstruction::And,
-                    rs: 3,
-                    rd: 0,
-                }
-            );
-
             cpu.cpsr.set_sign_flag(true);
             cpu.cpsr.set_zero_flag(true);
             cpu.registers.set_register_at(0, 1000);
@@ -2378,14 +1444,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0010_0011_1110;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::AluOp {
-                    op: ThumbModeAluInstruction::Tst,
-                    rs: 7,
-                    rd: 6,
-                }
-            );
 
             cpu.execute_thumb(op_code);
 
@@ -2397,14 +1455,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0011_0010_1010;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::AluOp {
-                    op: ThumbModeAluInstruction::Orr,
-                    rs: 5,
-                    rd: 2,
-                }
-            );
 
             cpu.registers.set_register_at(2, 90);
             cpu.registers.set_register_at(5, 97);
@@ -2421,14 +1471,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0011_1100_1111;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::AluOp {
-                    op: ThumbModeAluInstruction::Mvn,
-                    rs: 1,
-                    rd: 7,
-                }
-            );
 
             cpu.execute_thumb(op_code);
 
@@ -2466,15 +1508,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1000_1_00001_000_001;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::LoadStoreHalfword {
-                    load_store: LoadStoreKind::Load,
-                    offset: 2,
-                    base_register: 0,
-                    source_destination_register: 1,
-                }
-            );
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory.lock().unwrap().write_half_word(102, 0xFF);
@@ -2488,15 +1521,6 @@ mod tests {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1000_0_00001_000_001;
             let op_code: ThumbModeOpcode = cpu.decode(op_code);
-            assert_eq!(
-                op_code.instruction,
-                ThumbModeInstruction::LoadStoreHalfword {
-                    load_store: LoadStoreKind::Store,
-                    offset: 2,
-                    base_register: 0,
-                    source_destination_register: 1,
-                }
-            );
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 0xFF);
@@ -2520,11 +1544,11 @@ mod tests {
             Test {
                 opcode: 0b0101_0_0_1_000_001_010,
                 expected_decode: ThumbModeInstruction::LoadStoreSignExtByteHalfword {
-                    h_flag: false,
+                    h: false,
                     sign_extend_flag: false,
-                    r_offset: 0,
-                    r_base: 1,
-                    r_destination: 2,
+                    offset_register: 0,
+                    base_register: 1,
+                    destination_register: 2,
                 },
                 prepare_fn: Box::new(|cpu| {
                     cpu.registers.set_register_at(0, 10);
@@ -2538,11 +1562,11 @@ mod tests {
             Test {
                 opcode: 0b0101_1_0_1_000_001_010,
                 expected_decode: ThumbModeInstruction::LoadStoreSignExtByteHalfword {
-                    h_flag: true,
+                    h: true,
                     sign_extend_flag: false,
-                    r_offset: 0,
-                    r_base: 1,
-                    r_destination: 2,
+                    offset_register: 0,
+                    base_register: 1,
+                    destination_register: 2,
                 },
                 prepare_fn: Box::new(|cpu| {
                     cpu.registers.set_register_at(0, 10);
@@ -2556,11 +1580,11 @@ mod tests {
             Test {
                 opcode: 0b0101_0_1_1_000_001_010,
                 expected_decode: ThumbModeInstruction::LoadStoreSignExtByteHalfword {
-                    h_flag: false,
+                    h: false,
                     sign_extend_flag: true,
-                    r_offset: 0,
-                    r_base: 1,
-                    r_destination: 2,
+                    offset_register: 0,
+                    base_register: 1,
+                    destination_register: 2,
                 },
                 prepare_fn: Box::new(|cpu| {
                     cpu.registers.set_register_at(0, 10);
@@ -2574,11 +1598,11 @@ mod tests {
             Test {
                 opcode: 0b0101_1_1_1_000_001_010,
                 expected_decode: ThumbModeInstruction::LoadStoreSignExtByteHalfword {
-                    h_flag: true,
+                    h: true,
                     sign_extend_flag: true,
-                    r_offset: 0,
-                    r_base: 1,
-                    r_destination: 2,
+                    offset_register: 0,
+                    base_register: 1,
+                    destination_register: 2,
                 },
                 prepare_fn: Box::new(|cpu| {
                     cpu.registers.set_register_at(0, 10);
@@ -2619,7 +1643,7 @@ mod tests {
                 opcode: 0b1010_1_001_00000010,
                 expected_decode: ThumbModeInstruction::LoadAddress {
                     sp: true,
-                    r_destination: 1,
+                    destination_register: 1,
                     offset: 8,
                 },
                 prepare_fn: Box::new(|cpu| {
@@ -2634,7 +1658,7 @@ mod tests {
                 opcode: 0b1010_0_001_00000010,
                 expected_decode: ThumbModeInstruction::LoadAddress {
                     sp: false,
-                    r_destination: 1,
+                    destination_register: 1,
                     offset: 8,
                 },
                 prepare_fn: Box::new(|cpu| {
