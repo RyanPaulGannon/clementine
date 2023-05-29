@@ -2,6 +2,7 @@ use std::convert::TryInto;
 use std::sync::{Arc, Mutex};
 
 use logger::log;
+use vecfixed::VecFixed;
 
 use crate::bitwise::Bits;
 use crate::cpu::arm;
@@ -15,6 +16,7 @@ use crate::cpu::thumb::mode::ThumbModeOpcode;
 use crate::memory::internal_memory::InternalMemory;
 
 use super::registers::Registers;
+use super::thumb;
 
 pub struct Arm7tdmi {
     pub(crate) memory: Arc<Mutex<InternalMemory>>,
@@ -25,7 +27,12 @@ pub struct Arm7tdmi {
 
     pub register_bank: RegisterBank,
 
-    pub disassembler_buffer: Vec<String>,
+    pub disassembler_buffer: VecFixed<1000, String>,
+
+    fetched_arm: Option<u32>,
+    decoded_arm: Option<ArmModeOpcode>,
+    fetched_thumb: Option<u16>,
+    decoded_thumb: Option<ThumbModeOpcode>,
 }
 
 impl Default for Arm7tdmi {
@@ -36,7 +43,11 @@ impl Default for Arm7tdmi {
             spsr: Psr::default(),
             registers: Registers::default(),
             register_bank: RegisterBank::default(),
-            disassembler_buffer: vec![],
+            disassembler_buffer: VecFixed::new(),
+            fetched_arm: None,
+            decoded_arm: None,
+            fetched_thumb: None,
+            decoded_thumb: None,
         };
 
         // Setting ARM mode at startup
@@ -49,146 +60,45 @@ impl Default for Arm7tdmi {
 }
 
 impl Arm7tdmi {
-    pub fn fetch_arm(&self) -> u32 {
-        self.memory
-            .lock()
-            .unwrap()
-            .read_word(self.registers.program_counter())
+    pub fn flush_pipeline(&mut self) {
+        self.decoded_arm = None;
+        self.decoded_thumb = None;
+        self.fetched_arm = None;
+        self.fetched_thumb = None;
     }
 
-    pub fn fetch_thumb(&self) -> u16 {
-        self.memory
-            .lock()
-            .unwrap()
-            .read_half_word(self.registers.program_counter())
+    pub fn fetch_arm(&mut self) -> u32 {
+        let mut pc = self.registers.program_counter() as u32;
+        pc.set_bit_off(0);
+        pc.set_bit_off(1);
+        self.registers.set_program_counter(pc);
+
+        self.memory.lock().unwrap().read_word(pc as usize)
     }
 
-    pub fn decode<T, V>(&self, op_code: V) -> T
+    pub fn fetch_thumb(&mut self) -> u16 {
+        let mut pc = self.registers.program_counter() as u32;
+        pc.set_bit_off(0);
+        self.registers.set_program_counter(pc);
+
+        self.memory.lock().unwrap().read_half_word(pc as usize)
+    }
+
+    pub fn decode<T, V>(op_code: V) -> T
     where
         T: std::fmt::Display + TryFrom<V>,
         <T as TryFrom<V>>::Error: std::fmt::Debug,
     {
-        let code = T::try_from(op_code).unwrap();
-        let pc = self.registers.program_counter();
-
-        log(format!("PC: 0x{pc:X} {code}"));
-        code
+        T::try_from(op_code).unwrap()
     }
 
     pub fn execute_arm(&mut self, op_code: ArmModeOpcode) {
         // Instruction functions should return whether PC has to be advanced
         // after instruction executed.
-        let bytes_to_advance = if !self.cpsr.can_execute(op_code.condition) {
-            Some(arm::operations::SIZE_OF_INSTRUCTION)
-        } else {
-            let decimal_value = self.registers.program_counter();
-            let padded_hex_value = format!("{decimal_value:#04X}");
-            self.disassembler_buffer.push(format!(
-                "{}: {}",
-                padded_hex_value,
-                op_code.instruction.disassembler()
-            ));
-            match op_code.instruction {
-                ArmModeInstruction::DataProcessing {
-                    condition: _,
-                    alu_instruction,
-                    set_conditions,
-                    op_kind,
-                    rn,
-                    destination,
-                    op2: _,
-                } => self.data_processing(
-                    op_code,
-                    alu_instruction,
-                    set_conditions,
-                    op_kind,
-                    rn,
-                    destination,
-                ),
-                ArmModeInstruction::Multiply => todo!(),
-                ArmModeInstruction::MultiplyLong => todo!(),
-                ArmModeInstruction::SingleDataSwap => todo!(),
-                ArmModeInstruction::BranchAndExchange {
-                    condition: _,
-                    register,
-                } => self.branch_and_exchange(register),
-                ArmModeInstruction::HalfwordDataTransferRegisterOffset => {
-                    self.half_word_data_transfer(op_code)
-                }
-                ArmModeInstruction::HalfwordDataTransferImmediateOffset => {
-                    self.half_word_data_transfer(op_code)
-                }
-                ArmModeInstruction::SingleDataTransfer {
-                    condition: _,
-                    kind,
-                    quantity,
-                    write_back,
-                    indexing,
-                    rd,
-                    base_register,
-                    offset_info,
-                    offsetting,
-                } => self.single_data_transfer(
-                    kind,
-                    quantity,
-                    write_back,
-                    indexing,
-                    rd,
-                    base_register,
-                    offset_info,
-                    offsetting,
-                ),
-                ArmModeInstruction::Undefined => todo!(),
-                ArmModeInstruction::BlockDataTransfer {
-                    condition: _,
-                    indexing,
-                    offsetting,
-                    load_psr,
-                    write_back,
-                    load_store,
-                    rn,
-                    register_list: reg_list,
-                } => self.block_data_transfer(
-                    indexing, offsetting, load_psr, write_back, load_store, rn, reg_list,
-                ),
-                ArmModeInstruction::Branch {
-                    condition: _,
-                    link,
-                    offset,
-                } => self.branch(link, offset),
-                ArmModeInstruction::CoprocessorDataTransfer {
-                    condition: _,
-                    indexing,
-                    offsetting,
-                    transfer_length,
-                    write_back,
-                    load_store,
-                    rn,
-                    crd,
-                    cp_number,
-                    offset,
-                } => self.coprocessor_data_transfer(
-                    indexing,
-                    offsetting,
-                    transfer_length,
-                    write_back,
-                    load_store,
-                    rn,
-                    crd,
-                    cp_number,
-                    offset,
-                ),
-                ArmModeInstruction::CoprocessorDataOperation => todo!(),
-                ArmModeInstruction::CoprocessorRegisterTransfer => todo!(),
-                ArmModeInstruction::SoftwareInterrupt => todo!(),
-            }
-        };
+        if !self.cpsr.can_execute(op_code.condition) {
+            return;
+        }
 
-        self.registers
-            .advance_program_counter(bytes_to_advance.unwrap_or(0));
-    }
-
-    pub fn execute_thumb(&mut self, op_code: ThumbModeOpcode) {
         let decimal_value = self.registers.program_counter();
         let padded_hex_value = format!("{decimal_value:#04X}");
         self.disassembler_buffer.push(format!(
@@ -196,7 +106,91 @@ impl Arm7tdmi {
             padded_hex_value,
             op_code.instruction.disassembler()
         ));
-        let bytes_to_advance: Option<u32> = match op_code.instruction {
+
+        match op_code.instruction {
+            ArmModeInstruction::DataProcessing {
+                condition: _,
+                alu_instruction,
+                set_conditions,
+                op_kind,
+                rn,
+                destination,
+                op2: _,
+            } => self.data_processing(
+                op_code,
+                alu_instruction,
+                set_conditions,
+                op_kind,
+                rn,
+                destination,
+            ),
+            ArmModeInstruction::Multiply => todo!(),
+            ArmModeInstruction::MultiplyLong => todo!(),
+            ArmModeInstruction::SingleDataSwap => todo!(),
+            ArmModeInstruction::BranchAndExchange {
+                condition: _,
+                register,
+            } => self.branch_and_exchange(register),
+            ArmModeInstruction::HalfwordDataTransferRegisterOffset => {
+                self.half_word_data_transfer(op_code)
+            }
+            ArmModeInstruction::HalfwordDataTransferImmediateOffset => {
+                self.half_word_data_transfer(op_code)
+            }
+            ArmModeInstruction::SingleDataTransfer {
+                condition: _,
+                kind,
+                quantity,
+                write_back,
+                indexing,
+                rd,
+                base_register,
+                offset_info,
+                offsetting,
+            } => self.single_data_transfer(
+                kind,
+                quantity,
+                write_back,
+                indexing,
+                rd,
+                base_register,
+                offset_info,
+                offsetting,
+            ),
+            ArmModeInstruction::Undefined => todo!(),
+            ArmModeInstruction::BlockDataTransfer {
+                condition: _,
+                indexing,
+                offsetting,
+                load_psr,
+                write_back,
+                load_store,
+                rn,
+                register_list: reg_list,
+            } => self.block_data_transfer(
+                indexing, offsetting, load_psr, write_back, load_store, rn, reg_list,
+            ),
+            ArmModeInstruction::Branch {
+                condition: _,
+                link,
+                offset,
+            } => self.branch(link, offset),
+            ArmModeInstruction::CoprocessorDataTransfer { .. } => todo!(),
+            ArmModeInstruction::CoprocessorDataOperation => todo!(),
+            ArmModeInstruction::CoprocessorRegisterTransfer => todo!(),
+            ArmModeInstruction::SoftwareInterrupt => todo!(),
+        };
+    }
+
+    pub fn execute_thumb(&mut self, op_code: ThumbModeOpcode) {
+        let decimal_value = self.registers.program_counter();
+        let padded_hex_value = format!("{decimal_value:#04X}");
+        self.disassembler_buffer.push(format!(
+            "{padded_hex_value}: {}",
+            op_code.instruction.disassembler()
+        ));
+
+        match op_code.instruction {
             ThumbModeInstruction::MoveShiftedRegister {
                 shift_operation: op,
                 offset5,
@@ -290,33 +284,50 @@ impl Arm7tdmi {
             ThumbModeInstruction::UncondBranch { offset } => self.uncond_branch(offset),
             ThumbModeInstruction::LongBranchLink { h, offset } => self.long_branch_link(h, offset),
         };
-
-        self.registers
-            .advance_program_counter(bytes_to_advance.unwrap_or(0));
     }
 
     pub fn step(&mut self) {
-        // We set pc lowest bits to 0. In ARM we set the 2 lsb to 0 because instructions are word aligned.
-        // In THUMB we set only the lsb to 0 because instructions are halfword aligned.
-
         match self.cpsr.cpu_state() {
             CpuState::Thumb => {
-                let mut pc = self.registers.program_counter() as u32;
-                pc.set_bit_off(0);
-                self.registers.set_program_counter(pc);
+                if let Some(decoded) = self.decoded_thumb {
+                    let current_ins = self.registers.program_counter() - 4;
 
-                let op = self.fetch_thumb();
-                let op = self.decode(op);
-                self.execute_thumb(op);
+                    log(format!("PC: 0x{current_ins:X} {decoded}"));
+
+                    self.execute_thumb(decoded);
+                }
+
+                if !matches!(self.cpsr.cpu_state(), CpuState::Thumb) {
+                    return;
+                }
+
+                self.decoded_thumb = self.fetched_thumb.map(Self::decode);
+                self.fetched_thumb = Some(self.fetch_thumb());
+
+                self.registers.set_program_counter(
+                    self.registers.program_counter() as u32
+                        + thumb::operations::SIZE_OF_INSTRUCTION,
+                );
             }
             CpuState::Arm => {
-                let mut pc = self.registers.program_counter() as u32;
-                pc.set_bit_off(0);
-                pc.set_bit_off(1);
-                self.registers.set_program_counter(pc);
-                let op = self.fetch_arm();
-                let op = self.decode(op);
-                self.execute_arm(op);
+                if let Some(decoded) = self.decoded_arm {
+                    let current_ins = self.registers.program_counter() - 4;
+
+                    log(format!("PC: 0x{current_ins:X} {decoded}"));
+
+                    self.execute_arm(decoded);
+                }
+
+                if !matches!(self.cpsr.cpu_state(), CpuState::Arm) {
+                    return;
+                }
+
+                self.decoded_arm = self.fetched_arm.map(Self::decode);
+                self.fetched_arm = Some(self.fetch_arm());
+
+                self.registers.set_program_counter(
+                    self.registers.program_counter() as u32 + arm::operations::SIZE_OF_INSTRUCTION,
+                );
             }
         }
     }
@@ -496,30 +507,31 @@ mod tests {
         // 15(1111b) << 2 = 60 bytes
         let op_code = 0b1110_1010_0000_0000_0000_0000_0000_1111;
         let mut cpu = Arm7tdmi::default();
-        let op_code: ArmModeOpcode = cpu.decode(op_code);
+        let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.execute_arm(op_code);
 
-        assert_eq!(cpu.registers.program_counter(), 68);
+        assert_eq!(cpu.registers.program_counter(), 60);
 
         // Covers a negative offset
 
         // -9 << 2 = -36 bytes
         let op_code = 0b1110_1010_1111_1111_1111_1111_1111_0111;
-        let op_code: ArmModeOpcode = cpu.decode(op_code);
+        let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.execute_arm(op_code);
 
-        assert_eq!(cpu.registers.program_counter(), 68 + 8 - 36);
+        assert_eq!(cpu.registers.program_counter(), 60 - 36);
 
         // Covers link
 
         let op_code = 0b1110_1011_0000_0000_0000_0000_0000_1111;
-        let op_code: ArmModeOpcode = cpu.decode(op_code);
+        let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.execute_arm(op_code);
 
-        assert_eq!(cpu.registers.register_at(14), 44);
+        // -4 because of pipelining (pc is at +8 so we've to do -4 to get the next instruction)
+        assert_eq!(cpu.registers.register_at(14), 24 - 4);
     }
 
     #[test]
@@ -528,7 +540,7 @@ mod tests {
         let op_code = 0b1110_1111_1111_1111_1111_1111_1111_1111;
         let mut cpu = Arm7tdmi::default();
 
-        let op_code: ArmModeOpcode = cpu.decode(op_code);
+        let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
         assert_eq!(op_code.condition, Condition::AL);
 
         cpu.execute_arm(op_code);
@@ -540,7 +552,7 @@ mod tests {
             // LDM with post-increment
             let op_code = 0b1110_100_0_1_0_1_1_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(13, 0x1000);
             {
@@ -561,7 +573,7 @@ mod tests {
             // LDM with pre-increment
             let op_code = 0b1110_100_1_1_0_1_1_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(13, 0x1000);
             {
@@ -582,7 +594,7 @@ mod tests {
             // LDM with post-decrement
             let op_code = 0b1110_100_0_0_0_1_1_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(13, 0x1000);
             {
@@ -603,7 +615,7 @@ mod tests {
             // LDM with pre-decrement
             let op_code = 0b1110_100_1_0_0_1_1_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(13, 0x1000);
             {
@@ -624,7 +636,7 @@ mod tests {
             // STM with post-increment
             let op_code = 0b1110_100_0_1_0_1_0_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             for r in 0..16 {
                 cpu.registers.set_register_at(r, r as u32);
@@ -645,7 +657,7 @@ mod tests {
             // STM with pre-increment
             let op_code = 0b1110_100_1_1_0_1_0_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             for r in 0..16 {
                 cpu.registers.set_register_at(r, r as u32);
@@ -667,7 +679,7 @@ mod tests {
             // STM with post-decrement
             let op_code = 0b1110_100_0_0_0_1_0_1101_0000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             for r in 0..16 {
                 cpu.registers.set_register_at(r, r as u32);
@@ -689,7 +701,7 @@ mod tests {
 
             let op_code = 0b1110_100_1_0_0_1_0_1101_1000000010100010;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             for r in 0..16 {
                 cpu.registers.set_register_at(r, r as u32);
@@ -702,7 +714,7 @@ mod tests {
             let memory = cpu.memory.lock().unwrap();
 
             assert_eq!(memory.read_at(0x1000), 0);
-            assert_eq!(memory.read_at(0x0FFC), 15 + 12);
+            assert_eq!(memory.read_at(0x0FFC), 15 + 4);
             assert_eq!(memory.read_at(0x0FF8), 7);
             assert_eq!(memory.read_at(0x0FF4), 5);
             assert_eq!(memory.read_at(0x0FF0), 1);
@@ -716,7 +728,7 @@ mod tests {
             // Register offset
             let op_code = 0b1110_0001_1000_0010_0000_0000_1011_0001;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
                 ArmModeInstruction::HalfwordDataTransferRegisterOffset
@@ -736,7 +748,7 @@ mod tests {
             // Immediate offset, pre-index, down, no wb, load, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_1_0_1_0_1_0000_0001_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory
@@ -753,7 +765,7 @@ mod tests {
             // Immediate offset, pre-index, down, wb, load, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_1_0_1_1_1_0000_0001_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory
@@ -770,7 +782,7 @@ mod tests {
             // Immediate offset, pre-index, up, wb, load, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_1_1_1_1_1_0000_0001_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory
@@ -787,7 +799,7 @@ mod tests {
             // Immediate offset, post-index, down, no wb (but implicit), load, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_0_0_1_0_1_0000_0001_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory.lock().unwrap().write_word(100, 0xFFFF1234);
@@ -801,7 +813,7 @@ mod tests {
             // Immediate offset, post-index, down, no wb (but implicit), load, signed byte
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_0_0_1_0_1_0000_0001_0001_1_10_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory.lock().unwrap().write_at(100, -5_i8 as u8);
@@ -815,7 +827,7 @@ mod tests {
             // Immediate offset, post-index, down, no wb (but implicit), load, signed halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_0_0_1_0_1_0000_0001_0001_1_11_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory
@@ -832,7 +844,7 @@ mod tests {
             // Immediate offset, post-index, down, no wb (but implicit), store, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_0_0_1_0_0_0000_0001_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 0xFFFF1234);
@@ -846,34 +858,34 @@ mod tests {
             // Immediate offset, post-index, down, no wb (but implicit), store PC, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_0_0_1_0_0_0000_1111_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_program_counter(500);
 
             cpu.execute_arm(op_code);
 
-            assert_eq!(cpu.memory.lock().unwrap().read_word(100), 512);
+            assert_eq!(cpu.memory.lock().unwrap().read_word(100), 504);
             assert_eq!(cpu.registers.register_at(0), 100 - 0b11111);
         }
         {
             // Immediate offset, pre-index, down, no wb, store PC, unsigned halfword, base PC
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_1_0_1_0_0_1111_1111_0001_1_01_1_1111;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_program_counter(500);
 
             cpu.execute_arm(op_code);
 
-            assert_eq!(cpu.memory.lock().unwrap().read_word(500 + 8 - 0b11111), 512);
-            assert_eq!(cpu.registers.program_counter(), 504);
+            assert_eq!(cpu.memory.lock().unwrap().read_word(500 - 0b11111), 504);
+            assert_eq!(cpu.registers.program_counter(), 500);
         }
         {
             // Register offset, post-index, down, no wb (but implicit), store PC, unsigned halfword
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1110_000_0_0_0_0_0_0000_1111_0000_1_01_1_0010;
-            let op_code: ArmModeOpcode = cpu.decode(op_code);
+            let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_program_counter(500);
@@ -881,7 +893,7 @@ mod tests {
 
             cpu.execute_arm(op_code);
 
-            assert_eq!(cpu.memory.lock().unwrap().read_word(100), 512);
+            assert_eq!(cpu.memory.lock().unwrap().read_word(100), 504);
             assert_eq!(cpu.registers.register_at(0), 100 - 0b11111);
         }
     }
@@ -890,10 +902,10 @@ mod tests {
     fn check_pc_relative_load() {
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b0100_1001_0101_1000_u16;
-        let op_code: ThumbModeOpcode = cpu.decode(op_code);
+        let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.registers.set_register_at(1, 10);
-        cpu.memory.lock().unwrap().write_at(356, 1);
+        cpu.memory.lock().unwrap().write_at(352, 1);
         cpu.execute_thumb(op_code);
 
         assert_eq!(cpu.registers.register_at(1), 1);
@@ -905,7 +917,7 @@ mod tests {
         {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0101_00_0_000_001_010;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 100);
@@ -919,7 +931,7 @@ mod tests {
         {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0101_01_0_000_001_010;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 100);
@@ -936,7 +948,7 @@ mod tests {
         {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0101_10_0_000_001_010;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 100);
@@ -950,7 +962,7 @@ mod tests {
         {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0101_11_0_000_001_010;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 100);
@@ -968,7 +980,7 @@ mod tests {
             // Store Word
             let op_code = 0b0110_0011_0111_1000;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
                 ThumbModeInstruction::LoadStoreImmOffset
@@ -985,7 +997,7 @@ mod tests {
             // Load Word
             let op_code = 0b0110_1011_0000_1111;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
                 ThumbModeInstruction::LoadStoreImmOffset
@@ -1003,7 +1015,7 @@ mod tests {
             // Store Byte
             let op_code = 0b0111_0010_0011_1000;
             let mut cpu = Arm7tdmi::default();
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
                 ThumbModeInstruction::LoadStoreImmOffset
@@ -1024,7 +1036,7 @@ mod tests {
         {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b00011_1_1_111_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 0b110);
 
@@ -1041,7 +1053,7 @@ mod tests {
         {
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b00011_1_0_001_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, u32::MAX);
 
@@ -1059,36 +1071,36 @@ mod tests {
     fn check_cond_branch() {
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b1101_1011_11111100;
-        let op_code: ThumbModeOpcode = cpu.decode(op_code);
+        let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.registers.set_program_counter(1000);
 
         cpu.execute_thumb(op_code);
 
         // Asserting no branch since condition is not satisfied
-        assert_eq!(cpu.registers.program_counter(), 1002);
+        assert_eq!(cpu.registers.program_counter(), 1000);
 
         cpu.cpsr.set_sign_flag(true);
 
         let op_code = 0b1101_1011_11111100;
-        let op_code: ThumbModeOpcode = cpu.decode(op_code);
+        let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
         cpu.execute_thumb(op_code);
 
         // Asserting branch now that we set the condition
-        assert_eq!(cpu.registers.program_counter(), 1002 + 4 - 8);
+        assert_eq!(cpu.registers.program_counter(), 1000 - 8);
     }
 
     #[test]
     fn check_uncond_branch() {
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b1110_0001_0010_1111;
-        let op_code: ThumbModeOpcode = cpu.decode(op_code);
+        let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.registers.set_program_counter(1000);
 
         cpu.execute_thumb(op_code);
 
-        assert_eq!(cpu.registers.program_counter(), 1610);
+        assert_eq!(cpu.registers.program_counter(), 1606);
     }
 
     #[test]
@@ -1097,7 +1109,7 @@ mod tests {
             // BX Hs
             let mut cpu = Arm7tdmi::default();
             let op_code: u16 = 0b0100_0111_0111_0000;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(14, 123);
             cpu.execute_thumb(op_code);
@@ -1108,7 +1120,7 @@ mod tests {
             // Add Rd, Hs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_00_0_1_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(8, 10);
             cpu.registers.set_register_at(1, 10);
@@ -1121,7 +1133,7 @@ mod tests {
             // Add Hd, Rs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_00_1_0_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 10);
             cpu.registers.set_register_at(9, 10);
@@ -1134,7 +1146,7 @@ mod tests {
             // Add Hd, Hs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_00_1_1_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(8, 10);
             cpu.registers.set_register_at(9, 10);
@@ -1147,7 +1159,7 @@ mod tests {
             // Cmp Rd, Hs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_01_0_1_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(8, 10);
             cpu.registers.set_register_at(1, 10);
@@ -1163,7 +1175,7 @@ mod tests {
             // Cmp Hd, Rs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_01_1_0_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 11);
             cpu.registers.set_register_at(9, 10);
@@ -1179,7 +1191,7 @@ mod tests {
             // Cmp Hd, Hs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_01_1_1_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(8, 10);
             cpu.registers.set_register_at(9, 11);
@@ -1195,7 +1207,7 @@ mod tests {
             // Mov Rd, Hs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_10_0_1_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(8, 10);
             cpu.registers.set_register_at(1, 11);
@@ -1208,7 +1220,7 @@ mod tests {
             // Mov Hd, Rs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_10_1_0_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 10);
             cpu.registers.set_register_at(9, 11);
@@ -1221,7 +1233,7 @@ mod tests {
             // Mov Hd, Hs
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b010001_10_1_1_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(8, 10);
             cpu.registers.set_register_at(9, 11);
@@ -1294,7 +1306,7 @@ mod tests {
             // Store + save LR
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1011_0101_1111_0000;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_program_counter(1000);
             cpu.registers.set_register_at(REG_LR, 1000);
@@ -1325,7 +1337,7 @@ mod tests {
             // Load + restore PC
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1011_1_10_1_1111_0000;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(REG_SP, 1000);
 
@@ -1356,7 +1368,7 @@ mod tests {
             // Positive offset
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b10110000_0_0000111;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(REG_SP, 1000);
 
@@ -1367,7 +1379,7 @@ mod tests {
         // Negative offset
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b10110000_1_0000111;
-        let op_code: ThumbModeOpcode = cpu.decode(op_code);
+        let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
         cpu.registers.set_register_at(REG_SP, 1000);
 
@@ -1382,7 +1394,7 @@ mod tests {
             // Load
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1001_1_000_00000111;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(REG_SP, 100);
             cpu.memory.lock().unwrap().write_word(100 + 0b11100, 999);
@@ -1395,7 +1407,7 @@ mod tests {
             // Store
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1001_0_000_00000111;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(REG_SP, 100);
             cpu.registers.set_register_at(0, 999);
@@ -1412,7 +1424,7 @@ mod tests {
             // mul
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0011_0110_0000;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.cpsr.set_sign_flag(true);
             cpu.cpsr.set_zero_flag(true);
@@ -1428,7 +1440,7 @@ mod tests {
             // and
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0000_0001_1000;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             cpu.cpsr.set_sign_flag(true);
             cpu.cpsr.set_zero_flag(true);
             cpu.registers.set_register_at(0, 1000);
@@ -1443,7 +1455,7 @@ mod tests {
             // tst
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0010_0011_1110;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.execute_thumb(op_code);
 
@@ -1454,7 +1466,7 @@ mod tests {
             // orr
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0011_0010_1010;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(2, 90);
             cpu.registers.set_register_at(5, 97);
@@ -1470,7 +1482,7 @@ mod tests {
             // mvn
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b0100_0011_1100_1111;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.execute_thumb(op_code);
 
@@ -1484,7 +1496,7 @@ mod tests {
     fn check_long_branch_link() {
         let mut cpu = Arm7tdmi::default();
         let op_code = 0b1111_1000_0100_0000;
-        let op_code: ThumbModeOpcode = cpu.decode(op_code);
+        let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
         assert_eq!(
             op_code.instruction,
             ThumbModeInstruction::LongBranchLink {
@@ -1497,7 +1509,8 @@ mod tests {
         cpu.registers.set_register_at(REG_LR, 200);
         cpu.execute_thumb(op_code);
 
-        assert_eq!(cpu.registers.register_at(REG_LR), 103);
+        // 98 | 1
+        assert_eq!(cpu.registers.register_at(REG_LR), 99);
         assert_eq!(cpu.registers.program_counter(), 328);
     }
 
@@ -1507,7 +1520,7 @@ mod tests {
             // Load
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1000_1_00001_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.memory.lock().unwrap().write_half_word(102, 0xFF);
@@ -1520,7 +1533,7 @@ mod tests {
             // Store
             let mut cpu = Arm7tdmi::default();
             let op_code = 0b1000_0_00001_000_001;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
 
             cpu.registers.set_register_at(0, 100);
             cpu.registers.set_register_at(1, 0xFF);
@@ -1618,7 +1631,7 @@ mod tests {
         for case in cases {
             let mut cpu = Arm7tdmi::default();
             let op_code = case.opcode;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(op_code.instruction, case.expected_decode);
 
             (*case.prepare_fn)(&mut cpu);
@@ -1666,13 +1679,13 @@ mod tests {
                 }),
                 check_fn: Box::new(|cpu| {
                     let v = cpu.registers.register_at(1);
-                    assert_eq!(v, 22);
+                    assert_eq!(v, 18);
                 }),
             },
         ] {
             let mut cpu = Arm7tdmi::default();
             let op_code = case.opcode;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(op_code.instruction, case.expected_decode);
 
             (*case.prepare_fn)(&mut cpu);
@@ -1734,7 +1747,7 @@ mod tests {
         for case in cases {
             let mut cpu = Arm7tdmi::default();
             let op_code = case.opcode;
-            let op_code: ThumbModeOpcode = cpu.decode(op_code);
+            let op_code: ThumbModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(op_code.instruction, case.expected_decode);
 
             (*case.prepare_fn)(&mut cpu);
