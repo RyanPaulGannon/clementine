@@ -4,15 +4,18 @@ use crate::cpu::arm::alu_instruction::{
 };
 use crate::cpu::arm::instructions::{SingleDataTransferKind, SingleDataTransferOffsetInfo};
 use crate::cpu::arm::mode::ArmModeOpcode;
-use crate::cpu::arm7tdmi::{Arm7tdmi, HalfwordTransferType};
+use crate::cpu::arm7tdmi::{Arm7tdmi, HalfwordTransferKind};
 use crate::cpu::cpu_modes::Mode;
 use crate::cpu::flags::{
-    Indexing, LoadStoreKind, Offsetting, OperandKind, ReadWriteKind, ShiftKind,
+    HalfwordDataTransferOffsetKind, Indexing, LoadStoreKind, Offsetting, OperandKind,
+    ReadWriteKind, ShiftKind,
 };
 use crate::cpu::psr::CpuState;
 use crate::cpu::registers::REG_PROGRAM_COUNTER;
 use crate::memory::io_device::IoDevice;
 use logger::log;
+
+use super::alu_instruction::{AluSecondOperandInfo, PsrKind};
 
 pub const SIZE_OF_INSTRUCTION: u32 = 4;
 
@@ -56,34 +59,10 @@ impl Arm7tdmi {
             Adc => self.adc(destination.try_into().unwrap(), op1, op2, set_conditions),
             Sbc => self.sbc(destination.try_into().unwrap(), op1, op2, set_conditions),
             Rsc => self.rsc(destination.try_into().unwrap(), op1, op2, set_conditions),
-            Tst => {
-                if set_conditions {
-                    self.tst(op1, op2);
-                } else {
-                    self.psr_transfer(op_code);
-                }
-            }
-            Teq => {
-                if set_conditions {
-                    self.teq(op1, op2);
-                } else {
-                    self.psr_transfer(op_code);
-                }
-            }
-            Cmp => {
-                if set_conditions {
-                    self.cmp(op1, op2);
-                } else {
-                    self.psr_transfer(op_code);
-                }
-            }
-            Cmn => {
-                if set_conditions {
-                    self.cmn(op1, op2);
-                } else {
-                    self.psr_transfer(op_code);
-                }
-            }
+            Tst => self.tst(op1, op2),
+            Teq => self.teq(op1, op2),
+            Cmp => self.cmp(op1, op2),
+            Cmn => self.cmn(op1, op2),
             Orr => self.orr(destination.try_into().unwrap(), op1, op2, set_conditions),
             Mov => self.mov(destination.try_into().unwrap(), op2, set_conditions),
             Bic => self.bic(destination.try_into().unwrap(), op1, op2, set_conditions),
@@ -97,47 +76,44 @@ impl Arm7tdmi {
         }
     }
 
-    fn psr_transfer(&mut self, op_code: ArmModeOpcode) {
-        let psr_kind = PsrOpKind::from(op_code.raw);
+    pub fn psr_transfer(&mut self, op_kind: PsrOpKind, psr_kind: PsrKind) {
+        if matches!(self.cpsr.mode(), Mode::System | Mode::User) && psr_kind == PsrKind::Spsr {
+            panic!("Can't access SPSR in System/User mode")
+        }
 
-        // P = 0 means CPSR, P = 1 means SPSR_mode
-        let p = op_code.get_bit(22);
-
-        match psr_kind {
-            PsrOpKind::Mrs => {
-                let rd = op_code.get_bits(12..=15);
-
-                if rd == REG_PROGRAM_COUNTER {
+        match op_kind {
+            PsrOpKind::Mrs {
+                destination_register,
+            } => {
+                if destination_register == REG_PROGRAM_COUNTER {
                     panic!("PSR transfer should not use R15 as source/destination");
                 }
 
-                let psr = match p {
-                    false => self.cpsr,
-                    true => self.get_spsr(),
+                let psr = match psr_kind {
+                    PsrKind::Cpsr => self.cpsr,
+                    PsrKind::Spsr => self.spsr,
                 };
 
                 self.registers
-                    .set_register_at(rd.try_into().unwrap(), psr.into());
+                    .set_register_at(destination_register.try_into().unwrap(), psr.into());
             }
-            PsrOpKind::Msr => {
-                let rm = op_code.get_bits(0..=3);
-                if rm == REG_PROGRAM_COUNTER {
+            PsrOpKind::Msr { source_register } => {
+                if source_register == REG_PROGRAM_COUNTER {
                     panic!("PSR transfer should not use R15 as source/destination");
                 }
 
-                let rm = self.registers.register_at(rm.try_into().unwrap());
+                let rm = self
+                    .registers
+                    .register_at(source_register.try_into().unwrap());
 
                 let current_mode = self.cpsr.mode();
 
-                if matches!(self.cpsr.mode(), Mode::System | Mode::User) && p {
-                    panic!("Can't access SPSR in System/User mode")
-                }
-
                 {
-                    let psr = match p {
-                        false => &mut self.cpsr,
-                        true => &mut self.spsr,
+                    let psr = match psr_kind {
+                        PsrKind::Cpsr => &mut self.cpsr,
+                        PsrKind::Spsr => &mut self.spsr,
                     };
+
                     // Setting flags
                     psr.set_sign_flag(rm.get_bit(31));
                     psr.set_zero_flag(rm.get_bit(30));
@@ -161,36 +137,27 @@ impl Arm7tdmi {
 
                 // If we're modifying CPSR we need to be sure we're not in User mode.
                 // Since in User mode we can only modify flags.
-                if !p && self.cpsr.mode() != Mode::User {
+                if psr_kind == PsrKind::Cpsr && self.cpsr.mode() != Mode::User {
                     self.swap_mode(rm.get_bits(0..=4).try_into().unwrap());
-                } else if p {
+                } else if psr_kind == PsrKind::Spsr {
                     // If we're modifying SPSR we're sure we're not in System|User (checked before)
                     // We use `set_mode_raw` since the BIOS sometimes writes 0 in the SPSR.
                     self.spsr.set_mode_raw(rm.get_bits(0..=4));
                 }
             }
-            PsrOpKind::MsrFlg => {
-                // Immediate: 0 register, 1 immediate
-                let i: OperandKind = op_code.get_bit(25).into();
-
-                let op = match i {
-                    OperandKind::Register => {
-                        let rm = op_code.get_bits(0..=3);
-                        self.registers.register_at(rm.try_into().unwrap())
-                    }
-                    OperandKind::Immediate => {
-                        let imm = op_code.get_bits(0..=7);
-                        let rotate = op_code.get_bits(8..=11);
-
-                        // FIXME: Is the *2 correct? Documentation doesn't specify it but
-                        // GBATEK says: 11-8    Shift applied to Imm   (ROR in steps of two 0-30)
-                        imm.rotate_right(rotate * 2)
-                    }
+            PsrOpKind::MsrFlg { operand } => {
+                let op = match operand {
+                    AluSecondOperandInfo::Register {
+                        shift_op: _,
+                        shift_kind: _,
+                        register,
+                    } => self.registers.register_at(register.try_into().unwrap()),
+                    AluSecondOperandInfo::Immediate { base, shift } => base.rotate_right(shift),
                 };
 
-                let psr = match p {
-                    false => &mut self.cpsr,
-                    true => &mut self.spsr,
+                let psr = match psr_kind {
+                    PsrKind::Cpsr => &mut self.cpsr,
+                    PsrKind::Spsr => &mut self.spsr,
                 };
 
                 // Setting flags
@@ -550,34 +517,30 @@ impl Arm7tdmi {
         self.flush_pipeline();
     }
 
-    pub fn half_word_data_transfer(&mut self, op_code: ArmModeOpcode) {
-        let indexing: Indexing = op_code.get_bit(24).into();
-        let offsetting: Offsetting = op_code.get_bit(23).into();
-        let write_back = op_code.get_bit(21);
-        let load_store: LoadStoreKind = op_code.get_bit(20).into();
-        let rn_base_register = op_code.get_bits(16..=19);
-        let rd_source_destination_register = op_code.get_bits(12..=15);
-        let transfer_type = HalfwordTransferType::from(op_code.get_bits(5..=6) as u8);
-
-        let operand_kind: OperandKind = op_code.get_bit(22).into();
-
-        let offset = match operand_kind {
-            OperandKind::Immediate => {
-                let immediate_offset_high = op_code.get_bits(8..=11);
-                let immediate_offset_low = op_code.get_bits(0..=3);
-                (immediate_offset_high << 4) | immediate_offset_low
-            }
-            OperandKind::Register => {
-                let rm: usize = op_code.get_bits(0..=3).try_into().unwrap();
-                self.registers.register_at(rm)
+    #[allow(clippy::too_many_arguments)]
+    pub fn half_word_data_transfer(
+        &mut self,
+        indexing: Indexing,
+        offsetting: Offsetting,
+        write_back: bool,
+        load_store_kind: LoadStoreKind,
+        offset_kind: HalfwordDataTransferOffsetKind,
+        base_register: u32,
+        source_destination_register: u32,
+        transfer_kind: HalfwordTransferKind,
+    ) {
+        let offset = match offset_kind {
+            HalfwordDataTransferOffsetKind::Immediate { offset } => offset,
+            HalfwordDataTransferOffsetKind::Register { register } => {
+                self.registers.register_at(register as usize)
             }
         };
 
         let address = self
             .registers
-            .register_at(rn_base_register.try_into().unwrap());
+            .register_at(base_register.try_into().unwrap());
 
-        if rn_base_register == REG_PROGRAM_COUNTER {
+        if base_register == REG_PROGRAM_COUNTER {
             if write_back {
                 panic!("WriteBack should not be specified when using R15 as base register.");
             }
@@ -600,43 +563,39 @@ impl Arm7tdmi {
 
         let mut mem = self.memory.lock().unwrap();
 
-        match load_store {
+        match load_store_kind {
             LoadStoreKind::Store => {
-                let value = if rd_source_destination_register == REG_PROGRAM_COUNTER {
+                let value = if source_destination_register == REG_PROGRAM_COUNTER {
                     let pc: u32 = self.registers.program_counter().try_into().unwrap();
                     pc + 4
                 } else {
                     self.registers
-                        .register_at(rd_source_destination_register as usize)
+                        .register_at(source_destination_register as usize)
                 };
 
-                match transfer_type {
-                    HalfwordTransferType::UnsignedHalfwords => {
+                match transfer_kind {
+                    HalfwordTransferKind::UnsignedHalfwords => {
                         mem.write_at(address, value.get_bits(0..=7) as u8);
                         mem.write_at(address + 1, value.get_bits(8..=15) as u8);
                     }
                     _ => unreachable!("HS flags can't be != from 01 for STORE (L=0)"),
                 };
             }
-            LoadStoreKind::Load => match transfer_type {
-                HalfwordTransferType::UnsignedHalfwords => {
+            LoadStoreKind::Load => match transfer_kind {
+                HalfwordTransferKind::UnsignedHalfwords => {
                     let v = mem.read_half_word(address);
                     self.registers
-                        .set_register_at(rd_source_destination_register as usize, v.into());
+                        .set_register_at(source_destination_register as usize, v.into());
                 }
-                HalfwordTransferType::SignedByte => {
+                HalfwordTransferKind::SignedByte => {
                     let v = mem.read_at(address) as u32;
-                    self.registers.set_register_at(
-                        rd_source_destination_register as usize,
-                        v.sign_extended(8),
-                    );
+                    self.registers
+                        .set_register_at(source_destination_register as usize, v.sign_extended(8));
                 }
-                HalfwordTransferType::SignedHalfwords => {
+                HalfwordTransferKind::SignedHalfwords => {
                     let v = mem.read_half_word(address) as u32;
-                    self.registers.set_register_at(
-                        rd_source_destination_register as usize,
-                        v.sign_extended(16),
-                    );
+                    self.registers
+                        .set_register_at(source_destination_register as usize, v.sign_extended(16));
                 }
             },
         }
@@ -645,11 +604,11 @@ impl Arm7tdmi {
 
         if indexing == Indexing::Post || write_back {
             self.registers
-                .set_register_at(rn_base_register.try_into().unwrap(), effective);
+                .set_register_at(base_register.try_into().unwrap(), effective);
         }
 
-        if load_store == LoadStoreKind::Load
-            && rd_source_destination_register == REG_PROGRAM_COUNTER
+        if load_store_kind == LoadStoreKind::Load
+            && source_destination_register == REG_PROGRAM_COUNTER
         {
             self.flush_pipeline();
         }
@@ -951,24 +910,18 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::EQ,
-                    alu_instruction: ArmModeAluInstruction::Teq,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 9,
-                    destination: 15,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 12,
+                    psr_kind: PsrKind::Cpsr,
+                    kind: PsrOpKind::Msr {
+                        source_register: 12
                     }
                 }
             );
 
             assert!(!cpu.cpsr.can_execute(op_code.condition));
             let asm = op_code.instruction.disassembler();
-            assert_eq!(asm, "TEQEQ R9, R12");
+            assert_eq!(asm, "MSREQ CPSR, R12");
         }
 
         let op_code = 0b1110_00_0_1001_1_1001_0011_000000000000;
@@ -1444,17 +1397,11 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::EQ,
-                    alu_instruction: ArmModeAluInstruction::Tst,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 15,
-                    destination: 12,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
+                    psr_kind: PsrKind::Cpsr,
+                    kind: PsrOpKind::Mrs {
+                        destination_register: 12
                     }
                 }
             );
@@ -2044,17 +1991,11 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::AL,
-                    alu_instruction: ArmModeAluInstruction::Tst,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 15,
-                    destination: 0,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
+                    psr_kind: PsrKind::Cpsr,
+                    kind: PsrOpKind::Mrs {
+                        destination_register: 0
                     }
                 }
             );
@@ -2079,21 +2020,14 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::AL,
-                    alu_instruction: ArmModeAluInstruction::Cmp,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 15,
-                    destination: 0,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
+                    psr_kind: PsrKind::Spsr,
+                    kind: PsrOpKind::Mrs {
+                        destination_register: 0
                     }
                 }
             );
-            cpu.cpsr.set_mode(Mode::Fiq);
 
             cpu.register_bank.spsr_fiq.set_state_bit(true);
             cpu.register_bank.spsr_fiq.set_mode(Mode::Fiq);
@@ -2101,6 +2035,8 @@ mod tests {
             cpu.register_bank.spsr_fiq.set_overflow_flag(true);
             cpu.register_bank.spsr_fiq.set_zero_flag(true);
             cpu.register_bank.spsr_fiq.set_sign_flag(true);
+
+            cpu.swap_mode(Mode::Fiq);
 
             cpu.execute_arm(op_code);
 
@@ -2116,18 +2052,10 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::AL,
-                    alu_instruction: ArmModeAluInstruction::Teq,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 9,
-                    destination: 15,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
-                    }
+                    psr_kind: PsrKind::Cpsr,
+                    kind: PsrOpKind::Msr { source_register: 0 }
                 }
             );
             cpu.cpsr.set_mode(Mode::User);
@@ -2146,18 +2074,10 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::AL,
-                    alu_instruction: ArmModeAluInstruction::Cmn,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 9,
-                    destination: 15,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
-                    }
+                    psr_kind: PsrKind::Spsr,
+                    kind: PsrOpKind::Msr { source_register: 0 }
                 }
             );
             cpu.cpsr.set_mode(Mode::Fiq);
@@ -2176,17 +2096,15 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::AL,
-                    alu_instruction: ArmModeAluInstruction::Teq,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 8,
-                    destination: 15,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
+                    psr_kind: PsrKind::Cpsr,
+                    kind: PsrOpKind::MsrFlg {
+                        operand: AluSecondOperandInfo::Register {
+                            shift_op: ShiftOperator::Immediate(0),
+                            shift_kind: ShiftKind::Lsl,
+                            register: 0
+                        }
                     }
                 }
             );
@@ -2206,17 +2124,15 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::DataProcessing {
+                ArmModeInstruction::PSRTransfer {
                     condition: Condition::AL,
-                    alu_instruction: ArmModeAluInstruction::Cmn,
-                    set_conditions: false,
-                    op_kind: OperandKind::Register,
-                    rn: 8,
-                    destination: 15,
-                    op2: AluSecondOperandInfo::Register {
-                        shift_op: ShiftOperator::Immediate(0),
-                        shift_kind: ShiftKind::Lsl,
-                        register: 0,
+                    psr_kind: PsrKind::Spsr,
+                    kind: PsrOpKind::MsrFlg {
+                        operand: AluSecondOperandInfo::Register {
+                            shift_op: ShiftOperator::Immediate(0),
+                            shift_kind: ShiftKind::Lsl,
+                            register: 0
+                        }
                     }
                 }
             );

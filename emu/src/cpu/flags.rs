@@ -132,6 +132,15 @@ impl From<bool> for LoadStoreKind {
     }
 }
 
+impl std::fmt::Display for LoadStoreKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load => write!(f, "LDR"),
+            Self::Store => write!(f, "STR"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Indexing {
     /// Add offset after transfer.
@@ -166,4 +175,10 @@ impl From<bool> for Offsetting {
             true => Self::Up,
         }
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HalfwordDataTransferOffsetKind {
+    Immediate { offset: u32 },
+    Register { register: u32 },
 }

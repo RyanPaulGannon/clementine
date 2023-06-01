@@ -2,11 +2,15 @@ use crate::bitwise::Bits;
 use crate::cpu::arm::alu_instruction::{
     AluSecondOperandInfo, ArmModeAluInstruction, ShiftOperator,
 };
+use crate::cpu::arm7tdmi::HalfwordTransferKind;
 use crate::cpu::condition::Condition;
 use crate::cpu::flags::{
-    Indexing, LoadStoreKind, Offsetting, OperandKind, ReadWriteKind, ShiftKind,
+    HalfwordDataTransferOffsetKind, Indexing, LoadStoreKind, Offsetting, OperandKind,
+    ReadWriteKind, ShiftKind,
 };
 use logger::log;
+
+use super::alu_instruction::{PsrKind, PsrOpKind};
 
 /// Possible operation on transfer data.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
@@ -77,6 +81,11 @@ pub enum ArmModeInstruction {
         destination: u32,
         op2: AluSecondOperandInfo,
     },
+    PSRTransfer {
+        condition: Condition,
+        psr_kind: PsrKind,
+        kind: PsrOpKind,
+    },
     Multiply,
     MultiplyLong,
     SingleDataSwap,
@@ -84,8 +93,17 @@ pub enum ArmModeInstruction {
         condition: Condition,
         register: usize,
     },
-    HalfwordDataTransferRegisterOffset,
-    HalfwordDataTransferImmediateOffset,
+    HalfwordDataTransfer {
+        condition: Condition,
+        indexing: Indexing,
+        offsetting: Offsetting,
+        write_back: bool,
+        load_store_kind: LoadStoreKind,
+        offset_kind: HalfwordDataTransferOffsetKind,
+        base_register: u32,
+        source_destination_register: u32,
+        transfer_kind: HalfwordTransferKind,
+    },
     SingleDataTransfer {
         condition: Condition,
         kind: SingleDataTransferKind,
@@ -169,6 +187,23 @@ impl ArmModeInstruction {
                     }
                 }
             }
+            Self::PSRTransfer {
+                condition,
+                psr_kind,
+                kind,
+            } => match kind {
+                PsrOpKind::Mrs {
+                    destination_register,
+                } => {
+                    format!("MRS{condition} R{destination_register}, {psr_kind}")
+                }
+                PsrOpKind::Msr { source_register } => {
+                    format!("MSR{condition} {psr_kind}, R{source_register}")
+                }
+                PsrOpKind::MsrFlg { operand } => {
+                    format!("MSR{condition} {psr_kind}_flg, {operand}")
+                }
+            },
             Self::Multiply => "".to_owned(),
             Self::MultiplyLong => "".to_owned(),
             Self::SingleDataSwap => "".to_owned(),
@@ -176,8 +211,49 @@ impl ArmModeInstruction {
                 condition,
                 register,
             } => format!("BX{condition} R{register}"),
-            Self::HalfwordDataTransferRegisterOffset => "".to_owned(),
-            Self::HalfwordDataTransferImmediateOffset => "".to_string(),
+            Self::HalfwordDataTransfer {
+                condition,
+                indexing,
+                offsetting,
+                load_store_kind,
+                transfer_kind,
+                source_destination_register,
+                offset_kind,
+                base_register,
+                write_back,
+                ..
+            } => {
+                let sign = match offsetting {
+                    Offsetting::Up => "+",
+                    Offsetting::Down => "-",
+                };
+
+                let offset = match offset_kind {
+                    HalfwordDataTransferOffsetKind::Immediate { offset } => {
+                        if *offset == 0 {
+                            String::new()
+                        } else {
+                            format!(",#{sign}{offset}")
+                        }
+                    }
+                    HalfwordDataTransferOffsetKind::Register { register } => {
+                        format!(",{sign}R{register}")
+                    }
+                };
+
+                let w = if *write_back { "!" } else { "" };
+
+                let address = match indexing {
+                    Indexing::Pre => {
+                        format!("[R{base_register}{offset}{w}]")
+                    }
+                    Indexing::Post => {
+                        format!("[R{base_register}]{offset}")
+                    }
+                };
+
+                format!("{load_store_kind}{condition}{transfer_kind} R{source_destination_register}, {address}")
+            }
             Self::SingleDataTransfer {
                 condition,
                 kind,
@@ -309,18 +385,38 @@ impl From<u32> for ArmModeInstruction {
             Multiply
         } else if op_code.get_bits(23..=27) == 0b00001 && op_code.get_bits(4..=7) == 0b1001 {
             MultiplyLong
-        } else if op_code.get_bits(25..=27) == 0b000
-            && !op_code.get_bit(22)
-            && op_code.get_bits(7..=11) == 0b00001
-            && op_code.get_bit(4)
-        {
-            HalfwordDataTransferRegisterOffset
-        } else if op_code.get_bits(25..=27) == 0b000
-            && op_code.get_bit(22)
-            && op_code.get_bit(7)
-            && op_code.get_bit(4)
-        {
-            HalfwordDataTransferImmediateOffset
+        } else if op_code.get_bits(25..=27) == 0b000 && op_code.get_bit(7) && op_code.get_bit(4) {
+            let indexing: Indexing = op_code.get_bit(24).into();
+            let offsetting: Offsetting = op_code.get_bit(23).into();
+            let write_back = op_code.get_bit(21);
+            let load_store_kind: LoadStoreKind = op_code.get_bit(20).into();
+            let base_register = op_code.get_bits(16..=19);
+            let source_destination_register = op_code.get_bits(12..=15);
+            let transfer_kind: HalfwordTransferKind = (op_code.get_bits(5..=6) as u8).into();
+            let operand_kind: OperandKind = op_code.get_bit(22).into();
+
+            HalfwordDataTransfer {
+                condition,
+                indexing,
+                offsetting,
+                write_back,
+                load_store_kind,
+                offset_kind: if operand_kind == OperandKind::Register {
+                    HalfwordDataTransferOffsetKind::Register {
+                        register: op_code.get_bits(0..=3),
+                    }
+                } else {
+                    let immediate_offset_high = op_code.get_bits(8..=11);
+                    let immediate_offset_low = op_code.get_bits(0..=3);
+
+                    HalfwordDataTransferOffsetKind::Immediate {
+                        offset: (immediate_offset_high << 4) | immediate_offset_low,
+                    }
+                },
+                base_register,
+                source_destination_register,
+                transfer_kind,
+            }
         } else if op_code.get_bits(25..=27) == 0b011 && op_code.get_bit(4) {
             log("undefined instruction decode...");
             Undefined
@@ -427,6 +523,22 @@ impl From<u32> for ArmModeInstruction {
             let op_kind: OperandKind = op_code.get_bit(25).into();
             let rd = op_code.get_bits(12..=15);
 
+            if matches!(
+                alu_instruction,
+                ArmModeAluInstruction::Tst
+                    | ArmModeAluInstruction::Teq
+                    | ArmModeAluInstruction::Cmp
+                    | ArmModeAluInstruction::Cmn
+            ) && !set_conditions
+            {
+                // PSR instruction
+                return PSRTransfer {
+                    condition,
+                    psr_kind: PsrKind::from(op_code.get_bit(22)),
+                    kind: PsrOpKind::from(op_code),
+                };
+            }
+
             let op2 = match op_kind {
                 OperandKind::Immediate => {
                     let shift = op_code.get_bits(8..=11) * 2;
@@ -478,8 +590,6 @@ impl std::fmt::Display for ArmModeInstruction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::arm::alu_instruction::{AluSecondOperandInfo, ShiftOperator};
-    use crate::cpu::flags::ShiftKind;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -556,29 +666,33 @@ mod tests {
     fn decode_data_processing() {
         let output = ArmModeInstruction::from(0b1110_00_0_1011_0_1001_1111_000000001110);
         assert_eq!(
-            ArmModeInstruction::DataProcessing {
+            ArmModeInstruction::PSRTransfer {
                 condition: Condition::AL,
-                alu_instruction: ArmModeAluInstruction::Cmn,
-                set_conditions: false,
-                op_kind: OperandKind::Register,
-                rn: 9,
-                destination: 15,
-                op2: AluSecondOperandInfo::Register {
-                    shift_op: ShiftOperator::Immediate(0),
-                    shift_kind: ShiftKind::Lsl,
-                    register: 14,
+                psr_kind: PsrKind::Spsr,
+                kind: PsrOpKind::Msr {
+                    source_register: 14
                 }
             },
             output
         );
-        assert_eq!("CMN R9, R14", output.disassembler());
+        assert_eq!("MSR SPSR, R14", output.disassembler());
     }
 
     #[test]
     fn decode_half_word_data_transfer_immediate_offset() {
         let output = ArmModeInstruction::from(0b1110_0001_1100_0001_0000_0000_1011_0000);
         assert_eq!(
-            ArmModeInstruction::HalfwordDataTransferImmediateOffset,
+            ArmModeInstruction::HalfwordDataTransfer {
+                condition: Condition::AL,
+                indexing: Indexing::Pre,
+                offsetting: Offsetting::Up,
+                write_back: false,
+                load_store_kind: LoadStoreKind::Store,
+                offset_kind: HalfwordDataTransferOffsetKind::Immediate { offset: 0 },
+                base_register: 1,
+                source_destination_register: 0,
+                transfer_kind: HalfwordTransferKind::UnsignedHalfwords,
+            },
             output
         );
     }
@@ -587,7 +701,17 @@ mod tests {
     fn decode_half_word_data_transfer_register_offset() {
         let output = ArmModeInstruction::from(0b1110_0001_1000_0010_0000_0000_1011_0001);
         assert_eq!(
-            ArmModeInstruction::HalfwordDataTransferRegisterOffset,
+            ArmModeInstruction::HalfwordDataTransfer {
+                condition: Condition::AL,
+                indexing: Indexing::Pre,
+                offsetting: Offsetting::Up,
+                write_back: false,
+                load_store_kind: LoadStoreKind::Store,
+                offset_kind: HalfwordDataTransferOffsetKind::Register { register: 1 },
+                base_register: 2,
+                source_destination_register: 0,
+                transfer_kind: HalfwordTransferKind::UnsignedHalfwords,
+            },
             output
         );
     }

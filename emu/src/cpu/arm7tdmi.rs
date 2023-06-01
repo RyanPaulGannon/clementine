@@ -124,6 +124,11 @@ impl Arm7tdmi {
                 rn,
                 destination,
             ),
+            ArmModeInstruction::PSRTransfer {
+                condition: _,
+                psr_kind,
+                kind,
+            } => self.psr_transfer(kind, psr_kind),
             ArmModeInstruction::Multiply => todo!(),
             ArmModeInstruction::MultiplyLong => todo!(),
             ArmModeInstruction::SingleDataSwap => todo!(),
@@ -131,12 +136,26 @@ impl Arm7tdmi {
                 condition: _,
                 register,
             } => self.branch_and_exchange(register),
-            ArmModeInstruction::HalfwordDataTransferRegisterOffset => {
-                self.half_word_data_transfer(op_code)
-            }
-            ArmModeInstruction::HalfwordDataTransferImmediateOffset => {
-                self.half_word_data_transfer(op_code)
-            }
+            ArmModeInstruction::HalfwordDataTransfer {
+                condition: _,
+                indexing,
+                offsetting,
+                write_back,
+                load_store_kind,
+                offset_kind,
+                base_register,
+                source_destination_register,
+                transfer_kind,
+            } => self.half_word_data_transfer(
+                indexing,
+                offsetting,
+                write_back,
+                load_store_kind,
+                offset_kind,
+                base_register,
+                source_destination_register,
+                transfer_kind,
+            ),
             ArmModeInstruction::SingleDataTransfer {
                 condition: _,
                 kind,
@@ -339,17 +358,6 @@ impl Arm7tdmi {
         }
     }
 
-    pub fn get_spsr(&self) -> Psr {
-        match self.cpsr.mode() {
-            Mode::User | Mode::System => panic!("Trying to access a SPSR in either User or System state which do not have banked SPSR."),
-            Mode::Fiq => self.register_bank.spsr_fiq,
-            Mode::Irq => self.register_bank.spsr_irq,
-            Mode::Abort => self.register_bank.spsr_abt,
-            Mode::Supervisor => self.register_bank.spsr_svc,
-            Mode::Undefined => self.register_bank.spsr_und
-        }
-    }
-
     pub fn swap_mode(&mut self, new_mode: Mode) {
         if self.cpsr.mode() == new_mode {
             return;
@@ -472,13 +480,14 @@ impl Arm7tdmi {
     }
 }
 
-pub enum HalfwordTransferType {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum HalfwordTransferKind {
     UnsignedHalfwords,
     SignedByte,
     SignedHalfwords,
 }
 
-impl From<u8> for HalfwordTransferType {
+impl From<u8> for HalfwordTransferKind {
     fn from(value: u8) -> Self {
         match value.get_bits(0..=1) {
             0b01 => Self::UnsignedHalfwords,
@@ -489,10 +498,20 @@ impl From<u8> for HalfwordTransferType {
     }
 }
 
+impl std::fmt::Display for HalfwordTransferKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsignedHalfwords => write!(f, "H"),
+            Self::SignedByte => write!(f, "SB"),
+            Self::SignedHalfwords => write!(f, "SH"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cpu::condition::Condition;
-    use crate::cpu::flags::LoadStoreKind;
+    use crate::cpu::flags::{HalfwordDataTransferOffsetKind, Indexing, LoadStoreKind, Offsetting};
     use crate::cpu::registers::{REG_LR, REG_PROGRAM_COUNTER, REG_SP};
     use crate::cpu::thumb::instruction::ThumbModeInstruction;
     use crate::memory::io_device::IoDevice;
@@ -731,7 +750,17 @@ mod tests {
             let op_code: ArmModeOpcode = Arm7tdmi::decode(op_code);
             assert_eq!(
                 op_code.instruction,
-                ArmModeInstruction::HalfwordDataTransferRegisterOffset
+                ArmModeInstruction::HalfwordDataTransfer {
+                    condition: Condition::AL,
+                    indexing: Indexing::Pre,
+                    offsetting: Offsetting::Up,
+                    write_back: false,
+                    load_store_kind: LoadStoreKind::Store,
+                    offset_kind: HalfwordDataTransferOffsetKind::Register { register: 1 },
+                    base_register: 2,
+                    source_destination_register: 0,
+                    transfer_kind: HalfwordTransferKind::UnsignedHalfwords,
+                }
             );
 
             cpu.registers.set_register_at(0, 16843009);

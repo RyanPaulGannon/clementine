@@ -41,18 +41,35 @@ impl std::fmt::Display for ArmModeOpcode {
             ArmModeInstruction::DataProcessing { .. } => {
                 "FMT: |_Cond__|0_0|I|_code__|S|__Rn___|__Rd___|_______operand2________|"
             }
+            ArmModeInstruction::PSRTransfer {
+                condition: _,
+                psr_kind: _,
+                kind,
+            } => match kind {
+                crate::cpu::arm::alu_instruction::PsrOpKind::Mrs { .. } => {
+                    "FMT: |_Cond__|0_0_0_1_0|P|0_0_1_1_1_1|_Rd__|0_0_0_0_0_0_0_0_0_0_0_0_0|"
+                }
+                crate::cpu::arm::alu_instruction::PsrOpKind::Msr { .. } => {
+                    "FMT: |_Cond__|0_0_0_1_0|P|1_0_1_0_0_1_1_1_1_1_0_0_0_0_0_0_0_0|__Rm___|"
+                }
+                crate::cpu::arm::alu_instruction::PsrOpKind::MsrFlg { .. } => {
+                    "FMT: |_Cond__|0_0|I|1_0|P|1_0_1_0_0_0_1_1_1_1|_Operand____|"
+                }
+            },
             ArmModeInstruction::Multiply => "FMT: |_Cond__|",
             ArmModeInstruction::MultiplyLong => "FMT: |_Cond__|",
             ArmModeInstruction::SingleDataSwap => "FMT: |_Cond__|",
             ArmModeInstruction::BranchAndExchange { .. } => {
                 "FMT: |_Cond__|0_0_0_1|0_0_1_0|1_1_1_1|1_1_1_1|1_1_1_1|0_0_0_1|__Rn___|"
             }
-            ArmModeInstruction::HalfwordDataTransferRegisterOffset => {
-                "FMT: |_Cond__|0_0_0|P|U|0|W|L|__Rn___|__Rd___|0_0_0_0|1|S|H|1|__Rm___|"
-            }
-            ArmModeInstruction::HalfwordDataTransferImmediateOffset => {
-                "FMT: |_Cond__|0_0_0|P|U|1|W|L|__Rn___|__Rd___|_Offset|1|S|H|1|_Offset|"
-            }
+            ArmModeInstruction::HalfwordDataTransfer { offset_kind, .. } => match offset_kind {
+                crate::cpu::flags::HalfwordDataTransferOffsetKind::Register { .. } => {
+                    "FMT: |_Cond__|0_0_0|P|U|0|W|L|__Rn___|__Rd___|0_0_0_0|1|S|H|1|__Rm___|"
+                }
+                crate::cpu::flags::HalfwordDataTransferOffsetKind::Immediate { .. } => {
+                    "FMT: |_Cond__|0_0_0|P|U|1|W|L|__Rn___|__Rd___|_Offset|1|S|H|1|_Offset|"
+                }
+            },
             ArmModeInstruction::SingleDataTransfer { .. } => {
                 "FMT: |_Cond__|0_1|I|P|U|B|W|L|__Rn___|__Rd___|________Offset_________|"
             }
