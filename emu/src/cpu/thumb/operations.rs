@@ -124,7 +124,11 @@ impl Arm7tdmi {
             ThumbModeAluInstruction::Cmp => {
                 self.cmp(self.registers.register_at(rd.try_into().unwrap()), rs)
             }
-            ThumbModeAluInstruction::Cmn => todo!(),
+            ThumbModeAluInstruction::Cmn => {
+                let op1 = self.registers.register_at(rd.try_into().unwrap());
+                let op2 = rs;
+                self.cmn(op1, op2);
+            }
             ThumbModeAluInstruction::Orr => self.orr(
                 rd.into(),
                 self.registers.register_at(rd.try_into().unwrap()),
@@ -136,7 +140,11 @@ impl Arm7tdmi {
                 rs,
                 self.registers.register_at(rd.try_into().unwrap()),
             ),
-            ThumbModeAluInstruction::Bic => todo!(),
+            ThumbModeAluInstruction::Bic => {
+                let op1 = self.registers.register_at(rd.into());
+
+                self.bic(rd.into(), op1, rs, true);
+            }
             ThumbModeAluInstruction::Mvn => {
                 self.mvn(rd.try_into().unwrap(), rs, true);
             }
@@ -216,14 +224,14 @@ impl Arm7tdmi {
         match (load_store, byte_word) {
             (LoadStoreKind::Store, ReadWriteKind::Byte) => {
                 let rd = (self.registers.register_at(rd) & 0xFF) as u8;
-                self.bus.write_at(address, rd);
+                self.bus.write_byte(address, rd);
             }
             (LoadStoreKind::Store, ReadWriteKind::Word) => {
                 let rd = self.registers.register_at(rd);
                 self.bus.write_word(address, rd);
             }
             (LoadStoreKind::Load, ReadWriteKind::Byte) => {
-                let value = self.bus.read_at(address);
+                let value = self.bus.read_byte(address);
                 self.registers.set_register_at(rd, value as u32);
             }
             (LoadStoreKind::Load, ReadWriteKind::Word) => {
@@ -263,7 +271,7 @@ impl Arm7tdmi {
             }
             // Load sign-extended byte
             (true, false) => {
-                let mut value = self.bus.read_at(address) as u32;
+                let mut value = self.bus.read_byte(address) as u32;
                 value = value.sign_extended(8);
 
                 self.registers
@@ -303,14 +311,14 @@ impl Arm7tdmi {
             }
             (LoadStoreKind::Store, ReadWriteKind::Byte) => {
                 let v = self.registers.register_at(rd);
-                self.bus.write_at(address, v as u8)
+                self.bus.write_byte(address, v as u8)
             }
             (LoadStoreKind::Load, ReadWriteKind::Word) => {
                 let v = self.bus.read_word(address);
                 self.registers.set_register_at(rd, v);
             }
             (LoadStoreKind::Load, ReadWriteKind::Byte) => {
-                let v = self.bus.read_at(address);
+                let v = self.bus.read_byte(address);
                 self.registers.set_register_at(rd, v as u32);
             }
         }
