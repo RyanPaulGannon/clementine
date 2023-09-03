@@ -3,7 +3,13 @@ use std::collections::HashMap;
 use logger::log;
 
 use crate::bitwise::Bits;
+use crate::cpu::hardware::dma::{Dma, DmaRegisters};
+use crate::cpu::hardware::interrupt_control::InterruptControl;
+use crate::cpu::hardware::keypad::Keypad;
 use crate::cpu::hardware::lcd::Lcd;
+use crate::cpu::hardware::serial::Serial;
+use crate::cpu::hardware::sound::Sound;
+use crate::cpu::hardware::timers::Timers;
 use crate::cpu::hardware::HardwareComponent;
 use crate::memory::{internal_memory::InternalMemory, io_device::IoDevice};
 
@@ -11,12 +17,450 @@ use crate::memory::{internal_memory::InternalMemory, io_device::IoDevice};
 pub struct Bus {
     pub internal_memory: InternalMemory,
     pub lcd: Lcd,
+    sound: Sound,
+    dma: Dma,
+    timers: Timers,
+    serial: Serial,
+    keypad: Keypad,
+    interrupt_control: InterruptControl,
     cycles_count: u128,
     last_used_address: usize,
     unused_region: HashMap<usize, u8>,
 }
 
 impl Bus {
+    fn read_interrupt_control_raw(&self, address: usize) -> u8 {
+        match address {
+            0x04000200 => self.interrupt_control.interrupt_enable.get_byte(0),
+            0x04000201 => self.interrupt_control.interrupt_enable.get_byte(1),
+            0x04000202 => self
+                .interrupt_control
+                .interrupt_request
+                .front()
+                .unwrap_or(&0)
+                .get_byte(0),
+            0x04000203 => self
+                .interrupt_control
+                .interrupt_request
+                .front()
+                .unwrap_or(&0)
+                .get_byte(1),
+            0x04000204 => self.interrupt_control.wait_state_control.get_byte(0),
+            0x04000205 => self.interrupt_control.wait_state_control.get_byte(1),
+            0x04000208 => self.interrupt_control.interrupt_master_enable.get_byte(0),
+            0x04000209 => self.interrupt_control.interrupt_master_enable.get_byte(1),
+            0x04000300 => self.interrupt_control.post_boot_flag.get_byte(0),
+            0x04000301 => panic!("Reading a write-only InterruptControl address"),
+            0x04000410 => self.interrupt_control.purpose_unknown.get_byte(0),
+            0x04000206
+            | 0x04000207
+            | 0x400020A..=0x40002FF
+            | 0x04000302..=0x0400040F
+            | 0x04000411 => {
+                log("read on unused memory");
+                *self.unused_region.get(&address).unwrap_or(&0)
+            }
+            _ => match address & 0b111 {
+                0x800 => self.interrupt_control.internal_memory_control.get_byte(0),
+                0x801 => self.interrupt_control.internal_memory_control.get_byte(1),
+                0x802 => self.interrupt_control.internal_memory_control.get_byte(2),
+                0x803 => self.interrupt_control.internal_memory_control.get_byte(3),
+                _ => {
+                    log("read on unused memory");
+                    *self.unused_region.get(&address).unwrap_or(&0)
+                }
+            },
+        }
+    }
+
+    fn write_interrupt_control_raw(&mut self, address: usize, value: u8) {
+        match address {
+            0x04000200 => self.interrupt_control.interrupt_enable.set_byte(0, value),
+            0x04000201 => self.interrupt_control.interrupt_enable.set_byte(1, value),
+            0x04000202 => {
+                let current_val = self.interrupt_control.interrupt_request.back_mut().unwrap();
+
+                *current_val &= !(value as u16);
+            }
+            0x04000203 => {
+                let current_val = self.interrupt_control.interrupt_request.back_mut().unwrap();
+
+                *current_val &= !((value as u16) << 8);
+            }
+            0x04000204 => self.interrupt_control.wait_state_control.set_byte(0, value),
+            0x04000205 => self.interrupt_control.wait_state_control.set_byte(1, value),
+            0x04000208 => self
+                .interrupt_control
+                .interrupt_master_enable
+                .set_byte(0, value),
+            0x04000209 => self
+                .interrupt_control
+                .interrupt_master_enable
+                .set_byte(1, value),
+            0x04000300 => self.interrupt_control.post_boot_flag.set_byte(0, value),
+            0x04000301 => self.interrupt_control.power_down_control.set_byte(0, value),
+            0x04000410 => self.interrupt_control.purpose_unknown.set_byte(0, value),
+            0x04000206
+            | 0x04000207
+            | 0x400020A..=0x40002FF
+            | 0x04000302..=0x0400040F
+            | 0x04000411 => {
+                log("write on unused memory");
+                self.unused_region.insert(address, value);
+            }
+            _ => match address & 0b111 {
+                0x800 => self
+                    .interrupt_control
+                    .internal_memory_control
+                    .set_byte(0, value),
+                0x801 => self
+                    .interrupt_control
+                    .internal_memory_control
+                    .set_byte(1, value),
+                0x802 => self
+                    .interrupt_control
+                    .internal_memory_control
+                    .set_byte(2, value),
+                0x803 => self
+                    .interrupt_control
+                    .internal_memory_control
+                    .set_byte(3, value),
+                _ => {
+                    log("write on unused memory");
+                    self.unused_region.insert(address, value);
+                }
+            },
+        }
+    }
+
+    fn read_keypad_raw(&self, address: usize) -> u8 {
+        match address {
+            0x4000130 => self.keypad.key_input.get_byte(0),
+            0x4000131 => self.keypad.key_input.get_byte(1),
+            0x4000132 => self.keypad.key_interrupt_control.get_byte(0),
+            0x4000133 => self.keypad.key_interrupt_control.get_byte(1),
+            _ => panic!("Keypad read address is out of bound"),
+        }
+    }
+
+    fn write_keypad_raw(&mut self, address: usize, value: u8) {
+        match address {
+            // 0x4000130 and 0x4000131 Should be read-only but CPU bios writes it.
+            0x4000130 => self.keypad.key_input.set_byte(0, value),
+            0x4000131 => self.keypad.key_input.set_byte(1, value),
+            0x4000132 => self.keypad.key_interrupt_control.set_byte(0, value),
+            0x4000133 => self.keypad.key_interrupt_control.set_byte(1, value),
+            _ => panic!("Keypad write address is out of bound"),
+        }
+    }
+
+    fn read_serial_raw(&self, address: usize) -> u8 {
+        match address {
+            0x04000120 => self.serial.sio_data_32_multi_data_0_data_1.get_byte(0),
+            0x04000121 => self.serial.sio_data_32_multi_data_0_data_1.get_byte(1),
+            0x04000122 => self.serial.sio_data_32_multi_data_0_data_1.get_byte(2),
+            0x04000123 => self.serial.sio_data_32_multi_data_0_data_1.get_byte(3),
+            0x04000124 => self.serial.sio_multi_data_2.get_byte(0),
+            0x04000125 => self.serial.sio_multi_data_2.get_byte(1),
+            0x04000126 => self.serial.sio_multi_data_3.get_byte(0),
+            0x04000127 => self.serial.sio_multi_data_3.get_byte(1),
+            0x04000128 => self.serial.sio_control_register.get_byte(0),
+            0x04000129 => self.serial.sio_control_register.get_byte(1),
+            0x0400012A => self.serial.sio_multi_data_send_data_8.get_byte(0),
+            0x0400012B => self.serial.sio_multi_data_send_data_8.get_byte(1),
+            0x04000134 => self.serial.sio_mode_select.get_byte(0),
+            0x04000135 => self.serial.sio_mode_select.get_byte(1),
+            0x04000136 => self.serial.infrared_register.get_byte(0),
+            0x04000137 => self.serial.infrared_register.get_byte(1),
+            0x04000140 => self.serial.sio_joy_bus_control.get_byte(0),
+            0x04000141 => self.serial.sio_joy_bus_control.get_byte(1),
+            0x04000150 => self.serial.sio_joy_bus_receive_data.get_byte(0),
+            0x04000151 => self.serial.sio_joy_bus_receive_data.get_byte(1),
+            0x04000152 => self.serial.sio_joy_bus_receive_data.get_byte(2),
+            0x04000153 => self.serial.sio_joy_bus_receive_data.get_byte(3),
+            0x04000154 => self.serial.sio_joy_bus_transmit_data.get_byte(0),
+            0x04000155 => self.serial.sio_joy_bus_transmit_data.get_byte(1),
+            0x04000156 => self.serial.sio_joy_bus_transmit_data.get_byte(2),
+            0x04000157 => self.serial.sio_joy_bus_transmit_data.get_byte(3),
+            0x04000158 => self.serial.sio_joy_bus_receive_status.get_byte(0),
+            0x04000159 => self.serial.sio_joy_bus_receive_status.get_byte(1),
+            0x0400012C..=0x0400012F
+            | 0x04000138..=0x04000139
+            | 0x04000142..=0x0400014F
+            | 0x0400015A..=0x040001FF => {
+                log(format!("read on unused memory {address:x}"));
+                *self.unused_region.get(&address).unwrap_or(&0)
+            }
+            _ => panic!("Serial read address is out of bound"),
+        }
+    }
+
+    fn write_serial_raw(&mut self, address: usize, value: u8) {
+        match address {
+            0x04000120 => self
+                .serial
+                .sio_data_32_multi_data_0_data_1
+                .set_byte(0, value),
+            0x04000121 => self
+                .serial
+                .sio_data_32_multi_data_0_data_1
+                .set_byte(1, value),
+            0x04000122 => self
+                .serial
+                .sio_data_32_multi_data_0_data_1
+                .set_byte(2, value),
+            0x04000123 => self
+                .serial
+                .sio_data_32_multi_data_0_data_1
+                .set_byte(3, value),
+            0x04000124 => self.serial.sio_multi_data_2.set_byte(0, value),
+            0x04000125 => self.serial.sio_multi_data_2.set_byte(1, value),
+            0x04000126 => self.serial.sio_multi_data_3.set_byte(0, value),
+            0x04000127 => self.serial.sio_multi_data_3.set_byte(1, value),
+            0x04000128 => self.serial.sio_control_register.set_byte(0, value),
+            0x04000129 => self.serial.sio_control_register.set_byte(1, value),
+            0x0400012A => self.serial.sio_multi_data_send_data_8.set_byte(0, value),
+            0x0400012B => self.serial.sio_multi_data_send_data_8.set_byte(1, value),
+            0x04000134 => self.serial.sio_mode_select.set_byte(0, value),
+            0x04000135 => self.serial.sio_mode_select.set_byte(1, value),
+            0x04000136 => self.serial.infrared_register.set_byte(0, value),
+            0x04000137 => self.serial.infrared_register.set_byte(1, value),
+            0x04000140 => self.serial.sio_joy_bus_control.set_byte(0, value),
+            0x04000141 => self.serial.sio_joy_bus_control.set_byte(1, value),
+            0x04000150 => self.serial.sio_joy_bus_receive_data.set_byte(0, value),
+            0x04000151 => self.serial.sio_joy_bus_receive_data.set_byte(1, value),
+            0x04000152 => self.serial.sio_joy_bus_receive_data.set_byte(2, value),
+            0x04000153 => self.serial.sio_joy_bus_receive_data.set_byte(3, value),
+            0x04000154 => self.serial.sio_joy_bus_transmit_data.set_byte(0, value),
+            0x04000155 => self.serial.sio_joy_bus_transmit_data.set_byte(1, value),
+            0x04000156 => self.serial.sio_joy_bus_transmit_data.set_byte(2, value),
+            0x04000157 => self.serial.sio_joy_bus_transmit_data.set_byte(3, value),
+            0x04000158 => self.serial.sio_joy_bus_receive_status.set_byte(0, value),
+            0x04000159 => self.serial.sio_joy_bus_receive_status.set_byte(1, value),
+            0x0400012C..=0x0400012F
+            | 0x04000138..=0x04000139
+            | 0x04000142..=0x0400014F
+            | 0x0400015A..=0x040001FF => {
+                log(format!("write on unused memory {address:x}"));
+                self.unused_region.insert(address, value);
+            }
+            _ => panic!("Serial write address is out of bound"),
+        }
+    }
+
+    fn read_timers_raw(&self, address: usize) -> u8 {
+        match address {
+            0x04000100 => self.timers.tm0cnt_l.get_byte(0),
+            0x04000101 => self.timers.tm0cnt_l.get_byte(1),
+            0x04000102 => self.timers.tm0cnt_h.get_byte(0),
+            0x04000103 => self.timers.tm0cnt_h.get_byte(1),
+            0x04000104 => self.timers.tm1cnt_l.get_byte(0),
+            0x04000105 => self.timers.tm1cnt_l.get_byte(1),
+            0x04000106 => self.timers.tm1cnt_h.get_byte(0),
+            0x04000107 => self.timers.tm1cnt_h.get_byte(1),
+            0x04000108 => self.timers.tm2cnt_l.get_byte(0),
+            0x04000109 => self.timers.tm2cnt_l.get_byte(1),
+            0x0400010A => self.timers.tm2cnt_h.get_byte(0),
+            0x0400010B => self.timers.tm2cnt_h.get_byte(1),
+            0x0400010C => self.timers.tm3cnt_l.get_byte(0),
+            0x0400010D => self.timers.tm3cnt_l.get_byte(1),
+            0x0400010E => self.timers.tm3cnt_h.get_byte(0),
+            0x0400010F => self.timers.tm3cnt_h.get_byte(1),
+            0x04000110..=0x0400011F => self.unused_region.get(&address).map_or(0, |v| *v),
+            _ => panic!("Timers read address is out of bound"),
+        }
+    }
+
+    fn write_timers_raw(&mut self, address: usize, value: u8) {
+        match address {
+            0x04000100 => self.timers.tm0cnt_l.set_byte(0, value),
+            0x04000101 => self.timers.tm0cnt_l.set_byte(1, value),
+            0x04000102 => self.timers.tm0cnt_h.set_byte(0, value),
+            0x04000103 => self.timers.tm0cnt_h.set_byte(1, value),
+            0x04000104 => self.timers.tm1cnt_l.set_byte(0, value),
+            0x04000105 => self.timers.tm1cnt_l.set_byte(1, value),
+            0x04000106 => self.timers.tm1cnt_h.set_byte(0, value),
+            0x04000107 => self.timers.tm1cnt_h.set_byte(1, value),
+            0x04000108 => self.timers.tm2cnt_l.set_byte(0, value),
+            0x04000109 => self.timers.tm2cnt_l.set_byte(1, value),
+            0x0400010A => self.timers.tm2cnt_h.set_byte(0, value),
+            0x0400010B => self.timers.tm2cnt_h.set_byte(1, value),
+            0x0400010C => self.timers.tm3cnt_l.set_byte(0, value),
+            0x0400010D => self.timers.tm3cnt_l.set_byte(1, value),
+            0x0400010E => self.timers.tm3cnt_h.set_byte(0, value),
+            0x0400010F => self.timers.tm3cnt_h.set_byte(1, value),
+            0x04000110..=0x0400011F => {
+                log(format!("write on unused memory {address:x}"));
+                self.unused_region.insert(address, value);
+            }
+            _ => panic!("Timers write address is out of bound"),
+        }
+    }
+
+    fn read_dma_raw(&self, address: usize) -> u8 {
+        let read_dma_bank = |channel: &DmaRegisters, address: usize| match address {
+            0..=9 => panic!("Reading a write-only DMA I/O register"),
+            10 => channel.control.get_byte(0),
+            11 => channel.control.get_byte(1),
+            _ => panic!("DMA channel read address is out of bound"),
+        };
+
+        match address {
+            0x040000B0..=0x040000BB => read_dma_bank(&self.dma.channels[0], address - 0x040000B0),
+            0x040000BC..=0x040000C7 => read_dma_bank(&self.dma.channels[0], address - 0x040000BC),
+            0x040000C8..=0x040000D3 => read_dma_bank(&self.dma.channels[0], address - 0x040000C8),
+            0x040000D4..=0x040000DF => read_dma_bank(&self.dma.channels[0], address - 0x040000D4),
+            0x040000E0..=0x040000FF => {
+                log("read on unused memory");
+                self.unused_region.get(&address).map_or(0, |v| *v)
+            }
+            _ => panic!("DMA read address is out of bound"),
+        }
+    }
+
+    fn write_dma_raw(&mut self, address: usize, value: u8) {
+        let write_dma_bank = |channel: &mut DmaRegisters, address: usize, value: u8| match address {
+            0 => channel.source_address.set_byte(0, value),
+            1 => channel.source_address.set_byte(1, value),
+            2 => channel.source_address.set_byte(2, value),
+            3 => channel.source_address.set_byte(3, value),
+            4 => channel.destination_address.set_byte(0, value),
+            5 => channel.destination_address.set_byte(1, value),
+            6 => channel.destination_address.set_byte(2, value),
+            7 => channel.destination_address.set_byte(3, value),
+            8 => channel.word_count.set_byte(0, value),
+            9 => channel.word_count.set_byte(1, value),
+            10 => channel.control.set_byte(0, value),
+            11 => channel.control.set_byte(1, value),
+            _ => panic!("DMA channel write-address is out of bound"),
+        };
+
+        match address {
+            0x040000B0..=0x040000BB => {
+                write_dma_bank(&mut self.dma.channels[0], address - 0x040000B0, value)
+            }
+            0x040000BC..=0x040000C7 => {
+                write_dma_bank(&mut self.dma.channels[1], address - 0x040000BC, value)
+            }
+            0x040000C8..=0x040000D3 => {
+                write_dma_bank(&mut self.dma.channels[2], address - 0x040000C8, value)
+            }
+            0x040000D4..=0x040000DF => {
+                write_dma_bank(&mut self.dma.channels[3], address - 0x040000D4, value)
+            }
+            0x040000E0..=0x040000FF => {
+                log("write on unused memory");
+                self.unused_region.insert(address, value);
+            }
+            _ => panic!("Not implemented write memory address: {address:x}"),
+        }
+    }
+
+    fn read_sound_raw(&self, address: usize) -> u8 {
+        match address {
+            0x04000060 => self.sound.channel1_sweep.get_byte(0),
+            0x04000061 => self.sound.channel1_sweep.get_byte(1),
+            0x04000062 => self.sound.channel1_duty_length_envelope.get_byte(0),
+            0x04000063 => self.sound.channel1_duty_length_envelope.get_byte(1),
+            0x04000064 => self.sound.channel1_frequency_control.get_byte(0),
+            0x04000065 => self.sound.channel1_frequency_control.get_byte(1),
+            0x04000068 => self.sound.channel2_duty_length_envelope.get_byte(0),
+            0x04000069 => self.sound.channel2_duty_length_envelope.get_byte(1),
+            0x0400006C => self.sound.channel2_frequency_control.get_byte(0),
+            0x0400006D => self.sound.channel2_frequency_control.get_byte(1),
+            0x04000070 => self.sound.channel3_stop_wave_ram_select.get_byte(0),
+            0x04000071 => self.sound.channel3_stop_wave_ram_select.get_byte(1),
+            0x04000072 => self.sound.channel3_length_volume.get_byte(0),
+            0x04000073 => self.sound.channel3_length_volume.get_byte(1),
+            0x04000074 => self.sound.channel3_frequency_control.get_byte(0),
+            0x04000075 => self.sound.channel3_frequency_control.get_byte(1),
+            0x04000078 => self.sound.channel4_length_envelope.get_byte(0),
+            0x04000079 => self.sound.channel4_length_envelope.get_byte(1),
+            0x0400007C => self.sound.channel4_frequency_control.get_byte(0),
+            0x0400007D => self.sound.channel4_frequency_control.get_byte(1),
+            0x04000080 => self.sound.control_stereo_volume_enable.get_byte(0),
+            0x04000081 => self.sound.control_stereo_volume_enable.get_byte(1),
+            0x04000082 => self.sound.control_mixing_dma_control.get_byte(0),
+            0x04000083 => self.sound.control_mixing_dma_control.get_byte(1),
+            0x04000084 => self.sound.control_sound_on_off.get_byte(0),
+            0x04000085 => self.sound.control_sound_on_off.get_byte(1),
+            0x04000088 => self.sound.sound_pwm_control.get_byte(0),
+            0x04000089 => self.sound.sound_pwm_control.get_byte(1),
+            0x04000090..=0x0400009F => self.sound.channel3_wave_pattern_ram[address - 0x0400090],
+            0x040000A0..=0x040000A7 => panic!("Reading a write-only Sound I/O register"),
+            0x04000066..=0x04000067
+            | 0x0400006A..=0x0400006B
+            | 0x0400006E..=0x0400006F
+            | 0x04000076..=0x04000077
+            | 0x0400007A..=0x0400007B
+            | 0x0400007E..=0x0400007F
+            | 0x04000086..=0x04000087
+            | 0x0400008A..=0x0400008F
+            | 0x040000A8..=0x040000AF => {
+                log(format!("read on unused memory {address:x}"));
+                self.unused_region.get(&address).map_or(0, |v| *v)
+            }
+            _ => panic!("Sound read address is out of bound"),
+        }
+    }
+
+    fn write_sound_raw(&mut self, address: usize, value: u8) {
+        match address {
+            0x04000060 => self.sound.channel1_sweep.set_byte(0, value),
+            0x04000061 => self.sound.channel1_sweep.set_byte(1, value),
+            0x04000062 => self.sound.channel1_duty_length_envelope.set_byte(0, value),
+            0x04000063 => self.sound.channel1_duty_length_envelope.set_byte(1, value),
+            0x04000064 => self.sound.channel1_frequency_control.set_byte(0, value),
+            0x04000065 => self.sound.channel1_frequency_control.set_byte(1, value),
+            0x04000068 => self.sound.channel2_duty_length_envelope.set_byte(0, value),
+            0x04000069 => self.sound.channel2_duty_length_envelope.set_byte(1, value),
+            0x0400006C => self.sound.channel2_frequency_control.set_byte(0, value),
+            0x0400006D => self.sound.channel2_frequency_control.set_byte(1, value),
+            0x04000070 => self.sound.channel3_stop_wave_ram_select.set_byte(0, value),
+            0x04000071 => self.sound.channel3_stop_wave_ram_select.set_byte(1, value),
+            0x04000072 => self.sound.channel3_length_volume.set_byte(0, value),
+            0x04000073 => self.sound.channel3_length_volume.set_byte(1, value),
+            0x04000074 => self.sound.channel3_frequency_control.set_byte(0, value),
+            0x04000075 => self.sound.channel3_frequency_control.set_byte(1, value),
+            0x04000078 => self.sound.channel4_length_envelope.set_byte(0, value),
+            0x04000079 => self.sound.channel4_length_envelope.set_byte(1, value),
+            0x0400007C => self.sound.channel4_frequency_control.set_byte(0, value),
+            0x0400007D => self.sound.channel4_frequency_control.set_byte(1, value),
+            0x04000080 => self.sound.control_stereo_volume_enable.set_byte(0, value),
+            0x04000081 => self.sound.control_stereo_volume_enable.set_byte(1, value),
+            0x04000082 => self.sound.control_mixing_dma_control.set_byte(0, value),
+            0x04000083 => self.sound.control_mixing_dma_control.set_byte(1, value),
+            0x04000084 => self.sound.control_sound_on_off.set_byte(0, value),
+            0x04000085 => self.sound.control_sound_on_off.set_byte(1, value),
+            0x04000088 => self.sound.sound_pwm_control.set_byte(0, value),
+            0x04000089 => self.sound.sound_pwm_control.set_byte(1, value),
+            0x04000090..=0x0400009F => {
+                self.sound.channel3_wave_pattern_ram[address - 0x04000090] = value
+            }
+            0x040000A0 => self.sound.channel_a_fifo.set_byte(0, value),
+            0x040000A1 => self.sound.channel_a_fifo.set_byte(1, value),
+            0x040000A2 => self.sound.channel_a_fifo.set_byte(2, value),
+            0x040000A3 => self.sound.channel_a_fifo.set_byte(3, value),
+            0x040000A4 => self.sound.channel_b_fifo.set_byte(0, value),
+            0x040000A5 => self.sound.channel_b_fifo.set_byte(1, value),
+            0x040000A6 => self.sound.channel_b_fifo.set_byte(2, value),
+            0x040000A7 => self.sound.channel_b_fifo.set_byte(3, value),
+            0x04000066..=0x04000067
+            | 0x0400006A..=0x0400006B
+            | 0x0400006E..=0x0400006F
+            | 0x04000076..=0x04000077
+            | 0x0400007A..=0x0400007B
+            | 0x0400007E..=0x0400007F
+            | 0x04000086..=0x04000087
+            | 0x0400008A..=0x0400008F
+            | 0x040000A8..=0x040000AF => {
+                log(format!("write on unused memory, {address:x}"));
+                self.unused_region.insert(address, value);
+            }
+            _ => panic!("Sound write address is out of bound"),
+        }
+    }
+
     fn read_lcd_raw(&self, address: usize) -> u8 {
         match address {
             0x04000000 => self.lcd.dispcnt.get_byte(0),
@@ -153,7 +597,12 @@ impl Bus {
     fn read_raw(&self, address: usize) -> u8 {
         match address {
             0x4000000..=0x400005F => self.read_lcd_raw(address),
-            // TODO: change also other devices similar to how LCD is handled
+            0x4000060..=0x40000AF => self.read_sound_raw(address),
+            0x40000B0..=0x40000FF => self.read_dma_raw(address),
+            0x4000100..=0x400011F => self.read_timers_raw(address),
+            0x4000120..=0x400012F | 0x4000134..=0x40001FF => self.read_serial_raw(address),
+            0x4000130..=0x4000133 => self.read_keypad_raw(address),
+            0x4000200..=0x4FFFFFF => self.read_interrupt_control_raw(address),
             _ => self.internal_memory.read_at(address),
         }
     }
@@ -161,7 +610,12 @@ impl Bus {
     fn write_raw(&mut self, address: usize, value: u8) {
         match address {
             0x4000000..=0x400005F => self.write_lcd_raw(address, value),
-            // TODO: read read_raw
+            0x4000060..=0x40000AF => self.write_sound_raw(address, value),
+            0x40000B0..=0x40000FF => self.write_dma_raw(address, value),
+            0x4000100..=0x400011F => self.write_timers_raw(address, value),
+            0x4000120..=0x400012F | 0x4000134..=0x40001FF => self.write_serial_raw(address, value),
+            0x4000130..=0x4000133 => self.write_keypad_raw(address, value),
+            0x4000200..=0x4FFFFFF => self.write_interrupt_control_raw(address, value),
             _ => self.internal_memory.write_at(address, value),
         }
     }
@@ -195,21 +649,8 @@ impl Bus {
         log(format!("CPU Cycles: {}", self.cycles_count));
 
         // Step ppu, dma, interrupts, timers, etc...
-        let val = *self
-            .internal_memory
-            .interrupts
-            .interrupt_request
-            .back()
-            .unwrap();
-        self.internal_memory.interrupts.interrupt_request.push(val);
-
-        let val = *self
-            .internal_memory
-            .interrupts
-            .interrupt_request
-            .back()
-            .unwrap();
-        self.internal_memory.interrupts.interrupt_request.push(val);
+        let val = *self.interrupt_control.interrupt_request.back().unwrap();
+        self.interrupt_control.interrupt_request.push(val);
 
         // A pixel takes 4 cycles to get drawn
         if self.cycles_count % 4 == 0 {
@@ -353,5 +794,24 @@ mod tests {
         let address = 0x04000049; // WININ higher byte
 
         assert_eq!(bus.read_raw(address), 5);
+    }
+
+    #[test]
+    fn test_write_timer_register() {
+        let mut bus = Bus::default();
+        let address = 0x04000100;
+
+        bus.write_raw(address, 10);
+        assert_eq!(bus.timers.tm0cnt_l, 10);
+    }
+
+    #[test]
+    fn test_read_timer_register() {
+        let mut bus = Bus::default();
+        let address = 0x04000100;
+
+        bus.timers.tm0cnt_l = (5 << 8) | 10;
+
+        assert_eq!(bus.read_raw(address), 10);
     }
 }

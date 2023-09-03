@@ -3,14 +3,7 @@ use std::collections::HashMap;
 use logger::log;
 
 use crate::bitwise::Bits;
-use crate::memory::dma::Dma;
 use crate::memory::io_device::IoDevice;
-use crate::memory::timer_registers::TimerRegisters;
-
-use super::interrupts::Interrupts;
-use super::keypad::Keypad;
-use super::serial_communication::SerialBus;
-use super::sound::Sound;
 
 pub struct InternalMemory {
     /// From 0x00000000 to 0x00003FFF (16 KBytes).
@@ -21,24 +14,6 @@ pub struct InternalMemory {
 
     /// From 0x03000000 to 0x03007FFF (32kb).
     working_iram: Vec<u8>,
-
-    /// From 0x04000060 to 0x040000AF
-    sound: Sound,
-
-    /// From 0x040000B0 to 0x040000E0 (0x30 bytes).
-    pub dma: Dma,
-
-    /// From 0x04000100 to 0x0400012F.
-    timer_registers: TimerRegisters,
-
-    /// From 0x04000130 to 0x04000133
-    keypad_input: Keypad,
-
-    /// From 0x04000134 to 0x0400015F
-    serial_communication2: SerialBus,
-
-    /// From 0x04000200 to 040003FE
-    pub interrupts: Interrupts,
 
     /// From 0x05000000 to  0x050001FF (512 bytes, 256 colors).
     pub bg_palette_ram: Vec<u8>,
@@ -79,12 +54,6 @@ impl InternalMemory {
             bios_system_rom: bios.to_vec(),
             working_ram: vec![0; 0x00040000],
             working_iram: vec![0; 0x00008000],
-            sound: Sound::default(),
-            dma: Dma::new(),
-            timer_registers: TimerRegisters::default(),
-            keypad_input: Keypad::default(),
-            serial_communication2: SerialBus::default(),
-            interrupts: Interrupts::default(),
             bg_palette_ram: vec![0; 0x200],
             obj_palette_ram: vec![0; 0x200],
             video_ram: vec![0; 0x00018000],
@@ -121,6 +90,23 @@ impl InternalMemory {
             (((address >> 1) & 0xFFFF) as u16).get_byte((address & 0b1) as u8)
         }
     }
+
+    const fn get_unmasked_address(
+        address: usize,
+        mask_get: usize,
+        mask_set: usize,
+        mask_shift: usize,
+        modulo: usize,
+    ) -> usize {
+        // Get the index of the mirror
+        let idx = (address & mask_get) >> mask_shift;
+        // Remove the mirror index from the address
+        let mut address = address & mask_set;
+        // Insert the unmasked index in the address
+        address |= (idx % modulo) << mask_shift;
+
+        address
+    }
 }
 
 impl IoDevice for InternalMemory {
@@ -130,26 +116,49 @@ impl IoDevice for InternalMemory {
     fn read_at(&self, address: Self::Address) -> Self::Value {
         match address {
             0x00000000..=0x00003FFF => self.bios_system_rom[address],
-            0x02000000..=0x0203FFFF => self.working_ram[address - 0x02000000],
-            0x03000000..=0x03007FFF => self.working_iram[address - 0x03000000],
-            0x04000060..=0x040000AF => self.sound.read_at(address),
-            0x040000B0..=0x040000FF => self.dma.read_at(address),
-            0x04000100..=0x0400012F => self.timer_registers.read_at(address),
-            0x04000130..=0x04000133 => self.keypad_input.read_at(address),
-            0x04000134..=0x0400015F => self.serial_communication2.read_at(address),
-            0x04000200..=0x04000804 => self.interrupts.read_at(address),
-            0x05000000..=0x050001FF => self.bg_palette_ram[address - 0x05000000],
-            0x05000200..=0x050003FF => self.obj_palette_ram[address - 0x05000200],
-            0x06000000..=0x06017FFF => self.video_ram[address - 0x06000000],
-            0x07000000..=0x070003FF => self.obj_attributes[address - 0x07000000],
+            0x02000000..=0x02FFFFFF => {
+                self.working_ram[Self::get_unmasked_address(address, 0x00FF0000, 0xFF00FFFF, 16, 4)
+                    - 0x02000000]
+            }
+            0x03000000..=0x03FFFFFF => {
+                self.working_iram[Self::get_unmasked_address(
+                    address, 0x00FFF000, 0xFF000FFF, 12, 8,
+                ) - 0x03000000]
+            }
+            0x05000000..=0x05FFFFFF => {
+                let unmasked_address =
+                    Self::get_unmasked_address(address, 0x00FFFF00, 0xFF0000FF, 8, 4);
+
+                match unmasked_address {
+                    0x05000000..=0x050001FF => self.bg_palette_ram[unmasked_address - 0x05000000],
+                    0x05000200..=0x050003FF => self.obj_palette_ram[unmasked_address - 0x05000200],
+                    _ => unreachable!(),
+                }
+            }
+            0x06000000..=0x06FFFFFF => {
+                let unmasked_address =
+                    Self::get_unmasked_address(address, 0x00FF0000, 0xFF00FFFF, 16, 2);
+
+                // VRAM is 64k+32k+32k with the last two 32k being one mirrors of each other
+                match unmasked_address {
+                    0x06000000..=0x06017FFF => self.video_ram[unmasked_address - 0x06000000],
+                    0x06018000..=0x0601FFFF => {
+                        self.video_ram[unmasked_address - 0x06000000 - 0x8000]
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            0x07000000..=0x07FFFFFF => {
+                let unmasked_address =
+                    Self::get_unmasked_address(address, 0x00FFFF00, 0xFF0000FF, 8, 4);
+
+                self.obj_attributes[unmasked_address - 0x07000000]
+            }
             0x08000000..=0x09FFFFFF => self.read_rom(address - 0x08000000),
             0x0A000000..=0x0BFFFFFF => self.read_rom(address - 0x0A000000),
             0x0C000000..=0x0DFFFFFF => self.read_rom(address - 0x0C000000),
             0x0E000000..=0x0E00FFFF => unimplemented!("SRAM region is unimplemented"),
-            0x03008000..=0x03FFFFFF
-            | 0x00004000..=0x01FFFFFF
-            | 0x10000000..=0xFFFFFFFF
-            | 0x06018000..=0x06FFFFFF => {
+            0x00004000..=0x01FFFFFF | 0x10000000..=0xFFFFFFFF => {
                 log(format!("read on unused memory {address:x}"));
                 self.unused_region.get(&address).map_or(0, |v| *v)
             }
@@ -161,25 +170,60 @@ impl IoDevice for InternalMemory {
         match address {
             0x00000000..=0x00003FFF => self.bios_system_rom[address] = value,
             0x02000000..=0x0203FFFF => self.working_ram[address - 0x02000000] = value,
+            // Mirror
+            0x02040000..=0x02FFFFFF => {
+                self.working_ram[Self::get_unmasked_address(
+                    address, 0x00FF0000, 0xFF00FFFF, 16, 4,
+                ) - 0x02000000] = value;
+            }
             0x03000000..=0x03007FFF => self.working_iram[address - 0x03000000] = value,
-            0x04000060..=0x040000AF => self.sound.write_at(address, value),
-            0x040000B0..=0x040000FF => self.dma.write_at(address, value),
-            0x04000100..=0x0400012F => self.timer_registers.write_at(address, value),
-            0x04000130..=0x04000133 => self.keypad_input.write_at(address, value),
-            0x04000134..=0x0400015F => self.serial_communication2.write_at(address, value),
-            0x04000200..=0x04000804 => self.interrupts.write_at(address, value),
-            0x05000000..=0x050001FF => self.bg_palette_ram[address - 0x05000000] = value,
-            0x05000200..=0x050003FF => self.obj_palette_ram[address - 0x05000200] = value,
-            0x06000000..=0x06017FFF => self.video_ram[address - 0x06000000] = value,
-            0x07000000..=0x070003FF => self.obj_attributes[address - 0x07000000] = value,
-            0x03008000..=0x03FFFFFF
-            | 0x00004000..=0x01FFFFFF
-            | 0x10000000..=0xFFFFFFFF
-            | 0x06018000..=0x06FFFFFF => {
-                log("write on unused memory");
-                if self.unused_region.insert(address, value).is_some() {}
+            // Mirror
+            0x03008000..=0x03FFFFFF => {
+                self.working_iram[Self::get_unmasked_address(
+                    address, 0x00FFF000, 0xFF000FFF, 12, 8,
+                ) - 0x03000000] = value
+            }
+            0x05000000..=0x05FFFFFF => {
+                let unmasked_address =
+                    Self::get_unmasked_address(address, 0x00FFFF00, 0xFF0000FF, 8, 4);
+
+                match unmasked_address {
+                    0x05000000..=0x050001FF => {
+                        self.bg_palette_ram[unmasked_address - 0x05000000] = value
+                    }
+                    0x05000200..=0x050003FF => {
+                        self.obj_palette_ram[unmasked_address - 0x05000200] = value
+                    }
+                    _ => unreachable!(),
+                };
+            }
+            0x06000000..=0x06FFFFFF => {
+                let unmasked_address =
+                    Self::get_unmasked_address(address, 0x00FF0000, 0xFF00FFFF, 16, 2);
+
+                // VRAM is 64k+32k+32k with the last two 32k being one mirrors of each other
+                match unmasked_address {
+                    0x06000000..=0x06017FFF => {
+                        self.video_ram[unmasked_address - 0x06000000] = value
+                    }
+                    0x06018000..=0x0601FFFF => {
+                        self.video_ram[unmasked_address - 0x06000000 - 0x8000] = value
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            0x07000000..=0x07FFFFFF => {
+                let unmasked_address =
+                    Self::get_unmasked_address(address, 0x00FFFF00, 0xFF0000FF, 8, 4);
+
+                self.obj_attributes[unmasked_address - 0x07000000] = value
+            }
+            0x00004000..=0x01FFFFFF | 0x10000000..=0xFFFFFFFF => {
+                log(format!("read on unused memory {address:x}"));
+                self.unused_region.insert(address, value);
             }
             0x08000000..=0x0FFFFFFF => {
+                // TODO: this should be split
                 self.rom[address - 0x08000000] = value;
             }
 
@@ -373,25 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn test_write_timer_register() {
-        let mut im = InternalMemory::default();
-        let address = 0x04000100;
-
-        im.write_at(address, 10);
-        assert_eq!(im.timer_registers.tm0cnt_l.read(), 10);
-    }
-
-    #[test]
-    fn test_read_timer_register() {
-        let mut im = InternalMemory::default();
-        let address = 0x04000100;
-
-        im.timer_registers.tm0cnt_l.write((5 << 8) | 10);
-
-        assert_eq!(im.read_at(address), 10);
-    }
-
-    #[test]
     fn test_read_rom() {
         let im = InternalMemory {
             rom: vec![1, 2, 3, 4],
@@ -447,5 +472,159 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(im.read_half_word(0), 0x3412);
+    }
+
+    #[test]
+    fn test_mirror_3ffffxx() {
+        let mut im = InternalMemory::default();
+        im.working_iram[0x7FF0] = 5;
+
+        assert_eq!(im.read_at(0x3FFFFF0), 5);
+
+        im.write_at(0x3FFFFA0, 10);
+
+        assert_eq!(im.working_iram[0x7FA0], 10);
+    }
+
+    #[test]
+    fn test_mirror_wram() {
+        let mut im = InternalMemory::default();
+        im.working_ram[0x010003] = 5;
+
+        assert_eq!(im.read_at(0x02010003), 5);
+        assert_eq!(im.read_at(0x02050003), 5);
+        assert_eq!(im.read_at(0x02350003), 5);
+        assert_eq!(im.read_at(0x02F50003), 5);
+
+        im.write_at(0x02010003, 2);
+        assert_eq!(im.working_ram[0x010003], 2);
+
+        im.write_at(0x02050003, 1);
+        assert_eq!(im.working_ram[0x010003], 1);
+
+        im.write_at(0x02350010, 1);
+        assert_eq!(im.working_ram[0x010010], 1);
+
+        im.write_at(0x02F5003F, 1);
+        assert_eq!(im.working_ram[0x01003F], 1);
+    }
+
+    #[test]
+    fn test_mirror_iram() {
+        let mut im = InternalMemory::default();
+        im.working_iram[0x21FF] = 5;
+
+        assert_eq!(im.read_at(0x030021FF), 5);
+        assert_eq!(im.read_at(0x0300A1FF), 5);
+        assert_eq!(im.read_at(0x030121FF), 5);
+        assert_eq!(im.read_at(0x03FFA1FF), 5);
+
+        im.write_at(0x030021FF, 2);
+        assert_eq!(im.working_iram[0x21FF], 2);
+
+        im.write_at(0x0300A1FF, 1);
+        assert_eq!(im.working_iram[0x21FF], 1);
+
+        im.write_at(0x030171FF, 10);
+        assert_eq!(im.working_iram[0x71FF], 10);
+
+        im.write_at(0x03FFF1FF, 1);
+        assert_eq!(im.working_iram[0x71FF], 1);
+    }
+
+    #[test]
+    fn test_mirror_bg_palette() {
+        let mut im = InternalMemory::default();
+        im.bg_palette_ram[0x134] = 5;
+
+        assert_eq!(im.read_at(0x05000134), 5);
+        assert_eq!(im.read_at(0x05000534), 5);
+        assert_eq!(im.read_at(0x05012534), 5);
+        assert_eq!(im.read_at(0x05FFFD34), 5);
+
+        im.write_at(0x05000134, 10);
+        assert_eq!(im.bg_palette_ram[0x134], 10);
+
+        im.write_at(0x05000534, 11);
+        assert_eq!(im.bg_palette_ram[0x134], 11);
+
+        im.write_at(0x05012534, 12);
+        assert_eq!(im.bg_palette_ram[0x134], 12);
+
+        im.write_at(0x05FFFD34, 13);
+        assert_eq!(im.bg_palette_ram[0x134], 13);
+    }
+
+    #[test]
+    fn test_mirror_obj_palette() {
+        let mut im = InternalMemory::default();
+        im.obj_palette_ram[0x134] = 5;
+
+        assert_eq!(im.read_at(0x05000334), 5);
+        assert_eq!(im.read_at(0x05000734), 5);
+        assert_eq!(im.read_at(0x05012734), 5);
+        assert_eq!(im.read_at(0x05FFFF34), 5);
+
+        im.write_at(0x05000334, 10);
+        assert_eq!(im.obj_palette_ram[0x134], 10);
+
+        im.write_at(0x05000734, 11);
+        assert_eq!(im.obj_palette_ram[0x134], 11);
+
+        im.write_at(0x05012734, 12);
+        assert_eq!(im.obj_palette_ram[0x134], 12);
+
+        im.write_at(0x05FFFF34, 13);
+        assert_eq!(im.obj_palette_ram[0x134], 13);
+    }
+
+    #[test]
+    fn test_mirror_vram() {
+        let mut im = InternalMemory::default();
+        im.video_ram[0x09345] = 5;
+
+        assert_eq!(im.read_at(0x06009345), 5);
+        assert_eq!(im.read_at(0x06029345), 5);
+        assert_eq!(im.read_at(0x06129345), 5);
+        assert_eq!(im.read_at(0x06FE9345), 5);
+
+        im.write_at(0x06009345, 1);
+        assert_eq!(im.video_ram[0x09345], 1);
+
+        im.write_at(0x06029345, 2);
+        assert_eq!(im.video_ram[0x09345], 2);
+
+        im.write_at(0x06129345, 3);
+        assert_eq!(im.video_ram[0x09345], 3);
+
+        im.write_at(0x06FE9345, 4);
+        assert_eq!(im.video_ram[0x09345], 4);
+
+        im.video_ram[0x11345] = 10;
+        assert_eq!(im.read_at(0x06019345), 10);
+        assert_eq!(im.read_at(0x06131345), 10);
+    }
+
+    #[test]
+    fn test_mirror_oam() {
+        let mut im = InternalMemory::default();
+        im.obj_attributes[0x134] = 5;
+
+        assert_eq!(im.read_at(0x07000134), 5);
+        assert_eq!(im.read_at(0x07000534), 5);
+        assert_eq!(im.read_at(0x0700F534), 5);
+        assert_eq!(im.read_at(0x07FFFD34), 5);
+
+        im.write_at(0x07000134, 10);
+        assert_eq!(im.obj_attributes[0x134], 10);
+
+        im.write_at(0x07000534, 11);
+        assert_eq!(im.obj_attributes[0x134], 11);
+
+        im.write_at(0x0700F534, 12);
+        assert_eq!(im.obj_attributes[0x134], 12);
+
+        im.write_at(0x07FFFD34, 13);
+        assert_eq!(im.obj_attributes[0x134], 13);
     }
 }
